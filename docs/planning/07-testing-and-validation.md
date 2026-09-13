@@ -21,7 +21,7 @@ checkpoint in the roadmap is defined relative to this oracle.
 - Chip modules in isolation (sound chips, I/O boards): feed known inputs,
   assert known outputs, independent of the rest of the board.
 
-### 2. Trace comparison (`tests/trace-compare/`)
+### 2. Trace comparison (`tests/trace-compare/`, and `tools/oracle-harness/` for the CPU specifically)
 - A harness that runs both our emulator and the MAME oracle from the same
   ROM/state, in lockstep, and diffs: CPU registers, memory contents, and
   instruction stream, after each instruction (or each N instructions once
@@ -34,6 +34,22 @@ checkpoint in the roadmap is defined relative to this oracle.
   with a defined numerical tolerance (floating/fixed-point results won't
   always be bit-identical, and that's fine as long as it's within tolerance
   and doesn't visibly drift over time).
+- **This exists and works today for the V60 core, without needing any game
+  ROM**: `tools/oracle-harness/` builds a minimal standalone MAME driver
+  (just a real `v60_device` + RAM, no Model 1 board) that runs a small
+  hand-written machine-code snippet and dumps register state, and
+  `compare_v60.py` checks it against `tests/unit/v60_test.cpp`'s same
+  expectations. Current result: 8/8 test programs match the reference core
+  exactly, covering MOV/CMP/ADD/SUB, both branch outcomes, and JSR. This is
+  meaningfully stronger evidence than the unit tests alone, since it
+  checks against the reference's actual runtime behavior rather than
+  against our own reading of its source — see
+  `docs/hardware-notes/07-v60-architecture.md` for two real hardware facts
+  (24-bit address masking; PC displays the raw, unmasked value even though
+  bus accesses are masked) this approach caught that source-reading alone
+  hadn't surfaced. Extend this same technique (a scoped, ROM-free MAME
+  driver wrapping just the device under test) to other chips as they're
+  implemented, not just the V60.
 
 ### 3. Framebuffer / audio comparison
 - Pixel-diff our rendered frames against oracle screenshots captured from

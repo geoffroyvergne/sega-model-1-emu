@@ -3,28 +3,67 @@
 Read this before committing serious time. Ordered roughly by how much they
 threaten the project, not by implementation order.
 
-## 1. The TGP (3D math coprocessor) is a near-black-box — **highest risk**
+Several items below were revised after actual Phase 0 research replaced
+earlier guesses — see `docs/hardware-notes/` for the sourced evidence behind
+each correction.
 
-Model 1's polygon math (matrix transforms, projection, clipping) is done by a
-dedicated coprocessor separate from the main game CPU. It is one of the
-least-documented chips in Sega's arcade history, and even MAME's own Model 1
-driver has historically leaned on **high-level emulation** (reimplementing
-what the chip *produces* algorithmically) rather than **low-level emulation**
-(running the chip's actual dumped microcode), because verified, complete
-firmware/microcode dumps for this specific board are hard to source publicly.
+## 1. The 3D pipeline splits into two roles with two different risk profiles — **still highest risk, now precisely scoped**
+
+*This section has been revised twice. First guess: the whole 3D pipeline was
+one undocumented black box needing HLE. Second guess, after finding MAME's
+real MB86233 CPU core: assume the whole thing should be LLE. Both were
+oversimplified — reading `model1_m.cpp` and `model1_v.cpp` directly
+(`docs/hardware-notes/02-tgp-coprocessor.md` and `05-video.md`) shows the
+real hardware has two separate roles, genuinely emulated two different ways
+even in current MAME. This version reflects that.*
+
+**Role A — "Coprocessor" (game logic math, e.g. physics/collision):** a real
+Fujitsu MB86233 DSP running per-game dumped microcode (315-5573/5711/5724),
+decapped and extracted by the CAPS0ff effort (2017). MAME emulates this with
+genuine low-level emulation (`cpu/mb86233/mb86233.cpp`, real instruction
+decode). **Plan: LLE from the start**, per `02-tgp-coprocessor.md`.
+
+**Role B — "Geometrizer" (vertex transform/projection feeding the
+rasterizer):** separate chips (315-5571/5572) whose ROMs are dumped but
+**not wired to any active device in MAME** — their function is instead a
+hand-written C++ behavioral simulation in `model1_v.cpp` (matrix transform →
+projection → frustum clipping → lighting → sort → scanline quad fill,
+driven by a display-list opcode dispatch). **Plan: HLE, following MAME's own
+proven approach**, per `05-video.md`. True LLE of the real 315-5571/5572
+microcode is a stretch goal beyond even what MAME does today, not v1 scope.
+
+Remaining risk, now precisely scoped instead of a vague "TGP is scary":
+
+- Role A: the MB86233's own instruction-set documentation is admitted
+  incomplete even by the people who reverse-engineered it — some opcodes may
+  need our own trial-and-error against captured traces. MAME's core also has
+  documented gaps (interrupts, fixed-point mode, stack pointer) that are
+  probably fine for our target games but should be checked, not assumed.
+- Role A: the shared-RAM auto-increment protocol and FIFO halt semantics
+  (`02-tgp-coprocessor.md`) are the strongest suspect for Virtua Fighter's
+  known collision-detection bugs — get this exactly right, and treat it as
+  a real research task for VF specifically, not just "implement the address
+  map."
+- Role B: the display-list opcode table (`tgp_render`/`tgp_scan`'s
+  `0x41`/`0xa`/`0xb`/`0xc`/`0xf`/etc. cases) isn't transcribed yet — needed
+  before Phase 6 can be scoped with confidence.
 
 - **Impact if unresolved:** wrong-looking 3D geometry, incorrect object
   positioning, or subtly wrong game physics/timing in all three target games,
   since all three are 3D-only — there's no fallback 2D mode to ship instead.
-- **Mitigation:** confirm exact current status (HLE vs LLE, and any firmware
-  dump availability) during Phase 0 research before estimating further. Budget
-  the HLE path as the baseline plan; treat LLE as a stretch goal contingent on
-  what's actually findable.
+- **Mitigation:** LLE for Role A (Coprocessor), HLE-following-MAME for Role B
+  (Geometrizer/rasterizer) — don't force both roles into the same emulation
+  strategy. Validate Role A instruction-by-instruction against the MAME
+  oracle; validate Role B by framebuffer/output comparison. Treat Virtua
+  Fighter's TGP-RAM-port timing specifically as a research task that may
+  require going beyond what the oracle can verify.
 
 ## 2. Multi-processor timing synchronization
 
-The board has at minimum a main CPU, a sound CPU (Z80), and the TGP running
-concurrently, all interacting through shared/dual-port memory and interrupts.
+The board has at minimum the main V60 CPU, the TGP (MB86233), a 68000-based
+sound/music CPU, and a Z80-based I/O board CPU (plus, for Star Wars Arcade
+only, a second Z80 on the digital sound board) all running concurrently,
+interacting through shared/dual-port memory and interrupts.
 Getting relative timing wrong causes race conditions that are invisible on
 real, deterministic hardware but manifest as glitches, hangs, or desyncs in
 emulation (classic "works on the first frame, hangs on frame 200" bugs).
@@ -100,7 +139,28 @@ profile early once subsystems are wired together, and keep the option of a
 recompiler for the main CPU on the table as a later optimization, not a
 day-one requirement.
 
-## 10. Realistic timeline
+## 10. The reference oracle itself doesn't fully work for two of the three target games
+
+This wasn't assumed in the original plan — it's a direct finding from
+reading MAME's own status flags (`docs/hardware-notes/06-mame-oracle-status.md`):
+Virtua Racing is flagged fully working, but **Virtua Fighter is flagged
+`MACHINE_NOT_WORKING`** and **Star Wars Arcade is flagged imperfect
+graphics and controls**. The testing strategy (testing doc) leans heavily
+on diffing against MAME as ground truth — that's solid for Virtua Racing,
+but for the other two games, matching the oracle exactly is not the same as
+being correct, and some of what we need to get right (e.g. Virtua Fighter's
+collision detection) is exactly what the oracle itself hasn't solved.
+
+- **Impact:** Phase 8 and Phase 9 exit criteria (roadmap doc) may need to
+  shift from "matches oracle" to "matches real hardware behavior sourced
+  another way" for specific subsystems — expect original research, not just
+  porting/debugging work, in those phases.
+- **Mitigation:** don't discover this mid-Phase-8. Budget for it now, and
+  keep an eye out for arcade-preservation video captures or other
+  independent references for Virtua Fighter/Star Wars Arcade behavior that
+  can serve as a secondary check when the oracle is known-wrong.
+
+## 11. Realistic timeline
 
 This is a part-time hobby project analog to "write a new SNES-class emulator
 from scratch, but for a system with 1/100th the documentation." Expect the

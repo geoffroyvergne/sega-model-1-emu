@@ -28,6 +28,19 @@ Phase 0.
 `docs/hardware-notes/`) covering CPU/TGP/video/sound/IO facts with sources,
 plus a working local MAME oracle and empty-but-working project scaffold.
 
+**Status:** nearly done. Research: CPU/TGP-Coprocessor/Geometrizer-rasterizer/
+sound/IO identities, the main memory map, the TGP interface protocol, and a
+full display-list opcode table are sourced and written up in
+`docs/hardware-notes/`. This forced several real corrections along the way
+(sound CPU is a 68000 not a Z80; the 3D pipeline splits into an LLE
+"Coprocessor" role and an HLE "Geometrizer/rasterizer" role, not one thing;
+Virtua Fighter and Star Wars Arcade are known-imperfect even in the
+oracle — see `docs/hardware-notes/06-mame-oracle-status.md`). A Model
+1-scoped MAME oracle binary has been built locally and confirmed working
+(`docs/hardware-notes/00-sources.md`). Still open: the trace-comparison
+harness skeleton itself, the `copro_data` ROM's contents, and the exact
+`push_object` polygon-strip stride.
+
 ## Phase 1 — Main CPU core (NEC V60) (est. 4–8 weeks)
 
 - Implement the V60 interpreter: full instruction set, addressing modes,
@@ -37,6 +50,72 @@ plus a working local MAME oracle and empty-but-working project scaffold.
   project.
 - Validate purely as a CPU, independent of the rest of the board, using
   instruction-level unit tests and any available V60 test vectors.
+
+**Status:** started. `src/cpu/v60/` has a register file, flags (Carry/
+Overflow/Sign/Zero — confirmed that's the *complete* flag set the reference
+implementation tracks, no parity despite naming, see
+`docs/hardware-notes/07-v60-architecture.md`), a `Bus` interface, and a
+correct, unit-tested instruction/addressing-mode slice: HALT, NOP,
+MOV(B/H/W), CMP(B/H/W), ADD(B/H/W), SUB(B/H/W), all 15 conditional branches
+(BV/BNV/BL/BNL/BE/BNE/BNH/BH/BN/BP/BR/BLT/BGE/BLE/BGT, each in 8-bit and
+16-bit displacement form), and JMP/JSR/RSR/RET — over register-direct,
+register-indirect, autoincrement, autodecrement, and 8-bit-displacement
+addressing. **The CPU can now execute a loop, an if-statement, and a
+function call**, not just straight-line code. 45 unit tests pass (doctest,
+vendored in `third_party/`).
+
+Adding ADD/SUB needed zero new addressing-mode code — they're
+read-modify-write on operand 2, and the `Operand` abstraction built for
+MOV/CMP already resolves op2 without eagerly reading or writing it, which
+turned out to be exactly what read-modify-write needs too. Branches
+surfaced a real, easy-to-get-backwards detail instead: the displacement is
+relative to the branch opcode's own address, not the following
+instruction. JMP/JSR/RSR/RET surfaced that the V60 actually has **two
+unrelated call/return conventions** (simple JSR/RSR, and a VAX-style
+CALL/RET that links the AP register into a stack frame) — only the simpler
+one is fully implemented; CALL itself is deferred since it doesn't fit the
+"operand 1 is always read" assumption `decode_format12` currently makes.
+All confirmed in `docs/hardware-notes/07-v60-architecture.md`.
+
+**This is no longer validated only by reading source and writing our own
+tests against that reading** — `tools/oracle-harness/` now runs real V60
+machine-code snippets through an actual MAME `v60_device` (no game ROM
+needed: just a minimal standalone driver) and checks the results against
+the same expectations as our unit tests. Current result: **8/8 test
+programs match the reference core exactly**, across MOV, CMP, ADD/SUB
+(including wraparound), both branch outcomes, and JSR. Building this also
+surfaced two more real, confirmed hardware facts (this configuration's
+24-bit address masking, and that the PC register displays a raw/unmasked
+value even though bus accesses are masked) — see the hardware note. This
+was worth doing now, while the core is still small: the two addressing-mode
+bugs already found this phase were both "internally consistent with our
+own tests, but wrong" — exactly the failure mode oracle comparison is
+positioned to catch that more unit tests against our own understanding
+cannot.
+
+Two real bugs were caught and fixed before they could propagate, both
+documented in the hardware note as cautionary examples:
+1. A subtraction-overflow flag formula with its XOR terms transposed.
+2. A more fundamental one: general-operand addressing modes are selected by
+   a modifier byte's top 3 bits *and* a separate `modm` bit together — the
+   same index means different things in each of two tables (index 3 is
+   register-*indirect* in one, register-*direct* in the other). The first
+   implementation checked only the modifier byte and was internally
+   consistent with its own (wrong) tests — re-reading MAME's `am1.hxx`
+   table definition directly is what caught it, not more unit tests against
+   the same wrong understanding. Worth remembering as this core grows.
+
+Also confirmed: **V60 cycle timing is unknown even in the reference
+implementation** (its own source: "Actual cycles / instruction is unknown",
+flat 8-cycle average) — this changes what this phase's exit criterion
+below should mean by "cycle counts": matching that same approximation, not
+some undiscovered ground truth.
+
+Remaining for this phase: the rest of the addressing modes (16/32-bit
+displacement, displacement-indirect, double-displacement, the "both
+operands general" case, bit-string/bit-field modes, immediate literals),
+ADD/SUB and the rest of the instruction set, interrupts, and the debugger
+UI.
 
 **Exit criterion:** instruction-trace diff against the MAME oracle stays
 clean for at least the first several thousand instructions of Virtua
@@ -64,29 +143,57 @@ matches for a frame that's dominated by 2D content.
 
 ## Phase 4 — Sound subsystem (est. 3–5 weeks)
 
-- Z80 interpreter, FM synthesis chip, MultiPCM sample playback, wired to the
-  shared scheduler.
+- 68000 interpreter (the music/FX board's real CPU — see
+  `docs/hardware-notes/03-sound.md`), FM synthesis chip (YM3438), and the
+  Sega 315-5560 sample-playback chip, wired to the shared scheduler.
+- A separate Z80 core (I/O board — needed by all three games regardless of
+  sound) is needed too, but is tracked under Phase 7/8/9's I/O work, not
+  here, since it's not part of music/FX synthesis.
 
 **Exit criterion:** audio output is recognizably correct (music/SFX play at
 the right pitch/tempo) for a captured sequence, spot-checked by ear and, where
 feasible, by comparing generated PCM buffers against the oracle's.
 
-## Phase 5 — TGP behavioral model (HLE) (est. 6–12 weeks — highest-risk phase)
+## Phase 5 — TGP Coprocessor: low-level emulation (est. 6–12 weeks — highest-risk phase)
 
-- Implement the 3D math coprocessor as a behavioral model per the
-  architecture doc: matrix transform, projection, clipping, polygon list
-  generation, matching the command protocol the main CPU actually uses.
-- This is where Phase 0's research pays off or doesn't — expect this phase's
-  estimate to be the least reliable one in this document.
+*Scope note: this phase covers Role A only (the game-logic "Coprocessor").
+Role B (the Geometrizer/rasterizer pipeline that actually produces 3D
+graphics) is Phase 6, and is HLE, not LLE — see
+`docs/hardware-notes/02-tgp-coprocessor.md` for why these are different
+chips emulated two different ways even in MAME.*
 
-**Exit criterion:** for a given fixed input scene (captured from the oracle),
-our TGP model produces the same transformed/projected polygon list (within a
-defined numerical tolerance) as the oracle.
+- Implement an original MB86233 interpreter (`src/cpu/mb86233/`): real
+  instruction decode/register file/ALU, plus the memory-mapped math helper
+  tables (sin/cos/inv/isqrt/atan), executing the same per-game dumped
+  microcode ROMs (315-5573/5711/5724) the real board runs.
+- Wire it to the main CPU via the real interface: the address/data port and
+  command FIFOs at `0xd00000-0xd80003`, including the real halt/stall
+  handshake (a full/empty FIFO actually halts the other CPU — this is not
+  optional polish, it's load-bearing for correct timing).
+- Expect some MB86233 opcodes to need trial-and-error against captured
+  traces — even the community's own decoding of this chip is admittedly
+  incomplete. This is where Phase 0's research pays off or doesn't; expect
+  this phase's estimate to be the least reliable one in this document.
 
-## Phase 6 — Quad rasterizer & full video (est. 4–8 weeks)
+**Exit criterion:** instruction-level trace diff against MAME's
+`mb86233.cpp` stays clean for representative Coprocessor programs (not just
+final output comparison — this role's job is game logic, not just numbers
+that "look visually right").
 
-- Implement the shaded-quad rasterizer consuming Phase 5's polygon lists,
-  matching original draw-order/sorting behavior.
+## Phase 6 — Geometrizer/rasterizer pipeline & full video (est. 6–10 weeks)
+
+*Scope note: this is Role B — the part that actually produces the 3D image.
+See `docs/hardware-notes/05-video.md`.*
+
+- Implement the pipeline as HLE, following MAME's own proven approach:
+  object-space transform → perspective projection → per-edge frustum
+  clipping → specular lighting → quad sort (draw-order, not Z-buffer) →
+  scanline quad rasterization (flat/Gouraud + investigate the "moiré" fill
+  variant's actual purpose).
+- Before writing code, transcribe the display-list opcode table
+  (`tgp_render`/`tgp_scan`'s `0x41`/`0xa`/`0xb`/`0xc`/`0xf`/etc. cases) into
+  `docs/hardware-notes/` — this was flagged as an open item in Phase 0 and
+  should be closed here if not already.
 - Integrate with the Phase 3 tile/sprite layer for the full composited frame.
 
 **Exit criterion:** framebuffer pixel-diff against oracle screenshots matches
@@ -104,20 +211,37 @@ correctly mapped analog controls.
 doc). Do not start Phase 8 until this is genuinely solid — the second and
 third games will stress-test every assumption made so far.**
 
-## Phase 8 — Virtua Fighter bring-up (est. 6–10 weeks)
+## Phase 8 — Virtua Fighter bring-up (est. 6–10 weeks, real risk of running longer)
 
 - New per-game descriptor, digital joystick + button I/O board.
 - Expect and budget for rework in TGP/rasterizer/bus assumptions that turn
   out to have been Virtua-Racing-specific.
+- **Known extra risk (see `docs/hardware-notes/06-mame-oracle-status.md`):**
+  MAME's own driver flags Virtua Fighter `MACHINE_NOT_WORKING`, with
+  community reports pointing at imperfect TGP RAM port timing breaking
+  collision detection when both characters attack simultaneously. The
+  oracle cannot fully validate this game — treat "matches MAME" as
+  necessary but not sufficient here, and expect to need an independent
+  reference (video captures of real hardware, etc.) for final validation.
 
-**Exit criterion:** same bar as Phase 7's exit criterion, for Virtua Fighter.
+**Exit criterion:** same bar as Phase 7's exit criterion, for Virtua Fighter,
+*plus* explicit sign-off that known oracle-divergent areas (collision
+detection timing) have been checked against something other than MAME.
 
 ## Phase 9 — Star Wars Arcade bring-up (est. 6–10 weeks)
 
-- New per-game descriptor, analog flight-stick I/O board, any unique sound/
-  speech requirements this title has that the others didn't exercise.
+- New per-game descriptor, analog flight-stick I/O board.
+- **New hardware, not just a new I/O board:** this game's ROM set includes a
+  Digital Sound Board — a second Z80 plus an MPEG decoder — that Virtua
+  Racing and Virtua Fighter don't have (`docs/hardware-notes/03-sound.md`).
+  Budget real time for this, not just control remapping.
+- MAME flags this game `MACHINE_IMPERFECT_GRAPHICS | MACHINE_IMPERFECT_CONTROLS`
+  (ship models periodically disappearing, analog control issues) — same
+  oracle-can't-fully-validate caveat as Phase 8.
 
-**Exit criterion:** same bar, for Star Wars Arcade.
+**Exit criterion:** same bar as Phase 7, for Star Wars Arcade, plus the DSB/
+MPEG audio path working and the same "checked beyond the oracle" sign-off
+for the known imperfect-graphics/controls areas.
 
 ## Phase 10 — Polish & performance pass (est. ongoing)
 
@@ -129,6 +253,7 @@ third games will stress-test every assumption made so far.**
 
 ## Stretch goals (post-v1, no estimate)
 
-- TGP low-level emulation (real microcode) if firmware becomes available.
-- Additional Model 1 board variants/regions.
+- Additional Model 1 board variants/regions (Wing War, NetMerc, Virtua Cop —
+  note these use the *other* "advanced" I/O board, `model1io2.cpp`, not the
+  one our three target games share).
 - Netplay, rewind/TAS tooling, deluxe-cabinet extras (force feedback, motion).

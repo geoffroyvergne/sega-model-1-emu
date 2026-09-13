@@ -89,48 +89,74 @@ assumptions from whichever game is brought up first (see challenges doc, #7).
 - Interpreter first; a later optional recompiler lives behind the same
   interface so it's a drop-in swap, not a rewrite (see strategy doc).
 
-### TGP — 3D math coprocessor (`src/tgp/`)
-- Starts as a **behavioral model**: given the same command stream the real
-  chip would receive (matrix loads, vertex data, transform/clip requests),
-  reproduce its outputs (transformed/projected/clipped vertices, generated
-  polygon lists) using reverse-engineered algorithms rather than emulating
-  actual chip microcode.
-- Interface is deliberately identical whether backed by HLE or (later) LLE,
-  so the rest of the system doesn't care which is active. This isolates the
-  project's single biggest risk (challenges doc, #1) behind one seam.
+### TGP Coprocessor — game-logic math (`src/tgp/`)
+- This is Role A from the challenges doc: the per-game "Coprocessor"
+  (315-5573/5711/5724 microcode) that games use for physics/collision/AI
+  helper math via the FIFO/RAM interface — see
+  `docs/hardware-notes/02-tgp-coprocessor.md`. Real dumped microcode exists
+  for it, so this is **LLE from the start**: an original MB86233 interpreter
+  (instruction decode, register file, ALU/float ops, plus the memory-mapped
+  math helper tables — sin/cos/inv/isqrt/atan) living at `src/cpu/mb86233/`.
+- `src/tgp/` itself is thin: it owns the main-CPU-facing interface — the
+  address/data port and the two command FIFOs at `0xd00000-0xd80003`,
+  including their real halt/stall handshake semantics (pushing a full FIFO
+  or popping an empty one actually halts the other CPU) — and wires that up
+  to the MB86233 core.
+- If some opcodes turn out to need trial-and-error against captured traces
+  (expected — even the community's own decoding is admitted incomplete),
+  that work stays inside `src/cpu/mb86233/` and doesn't leak into the rest
+  of the system.
 
 ### Video subsystem (`src/video/`)
 - **Tile/sprite layer**: conventional tilemap + sprite compositing, used for
   HUD, backgrounds, and UI — bring this up first since it's far better
   understood than the 3D path and gives an early visual signal that the CPU
   core and memory map are basically correct.
-- **Quad rasterizer**: consumes polygon lists from the TGP and rasterizes
-  Sega's shaded quads (flat/Gouraud) into the frame buffer, respecting the
-  original draw-order-based sorting behavior rather than a modern Z-buffer
-  (see challenges doc, #4). Runs on the CPU (software rasterization) to
-  match original ordering/blending semantics; do not offload this to a GPU
-  shader pipeline for v1 — correctness before performance.
+- **Geometrizer + rasterizer pipeline** (Role B from the challenges doc):
+  object-space vertex transform → perspective projection → per-edge frustum
+  clipping → lighting (specular term) → quad sort (draw-order, not a
+  Z-buffer — confirmed, see challenges doc #4) → scanline quad
+  rasterization (flat/Gouraud shaded, plus a "moiré" fill variant whose
+  exact purpose is still to be confirmed). This whole pipeline is **HLE**,
+  following MAME's own proven approach (`docs/hardware-notes/05-video.md`)
+  rather than real 315-5571/5572 microcode — true LLE there is a stretch
+  goal, not v1 scope. Driven by a double-buffered display-list opcode
+  dispatch; the exact opcode table is still to be documented (Phase 0
+  follow-up, before Phase 6).
+- Runs on the CPU (software implementation) to match original
+  ordering/blending semantics; do not offload this to a GPU shader pipeline
+  for v1 — correctness before performance.
 - Produces one framebuffer per frame that the frontend blits (optionally
   GPU-upscaled/filtered at the presentation stage only, never in the logic
   that decides pixel values).
 
 ### Sound unit (`src/sound/`)
-- Z80 interpreter (well-trodden territory; reuse well-understood public
-  patterns for the core, but keep it a clean, self-contained implementation
-  living in `src/cpu/z80/`).
-- FM synthesis chip (YM3438-family) and Sega MultiPCM sample-playback chip
-  emulation. Prefer building on an existing permissively-licensed,
-  well-regarded chip-emulation library (e.g. a BSD/MIT-licensed FM synth
-  core) rather than reinventing FM synthesis math from scratch — confirm
-  exact chip identities and best available library options during Phase 0
-  research, and record the choice + license in the legal doc.
+- The music/FX board's CPU is a **68000** (`TMP68000N-10`, 10 MHz) — not a
+  Z80, correcting an earlier assumption in this doc (see
+  `docs/hardware-notes/03-sound.md`). Lives at `src/cpu/m68000/`.
+- FM synthesis (YM3438, 8 MHz) and sample playback (Sega custom `315-5560`,
+  believed to be a MultiPCM variant — confirm during Phase 4) emulation.
+  Prefer building on an existing permissively-licensed, well-regarded
+  chip-emulation library rather than reinventing FM synthesis math from
+  scratch — confirm the specific library during Phase 4 and record the
+  choice + license in the legal doc.
 - Runs on the same master scheduler, not a separate audio thread with its
   own notion of time, to keep music/SFX sync correct.
+- **Star Wars Arcade only:** an additional Digital Sound Board (a second,
+  separate Z80 driving an MPEG decoder) is present in that game's ROM set
+  and not the other two — a genuine per-game hardware difference to handle
+  via the per-game descriptor, not a core assumption.
 
 ### I/O boards (`src/io/`)
-- One implementation per control scheme: analog wheel + pedals (Virtua
-  Racing), digital 8-way + buttons (Virtua Fighter), analog stick + trigger
-  (Star Wars Arcade).
+- The standard I/O board (used by all three target games, board part
+  `837-8950-01`) has its own **Z80** CPU (4 MHz) plus an OKI M6253 ADC for
+  analog inputs — lives at `src/cpu/z80/` (shared with the Star Wars Arcade
+  digital sound board's Z80, which is a separate CPU instance using the same
+  core). See `docs/hardware-notes/04-io-and-controls.md`.
+- One control-scheme configuration per game on top of that shared board:
+  analog wheel + pedals (Virtua Racing, via CN2), digital 8-way + buttons
+  (Virtua Fighter, via CN1), analog stick + trigger (Star Wars Arcade, via
+  CN1).
 - Each translates real input events (from the frontend's input layer) into
   whatever the game's actual I/O board protocol expects (register reads,
   serial/analog port behavior) — the emulated game code should never know
@@ -159,8 +185,10 @@ sega-model-1-emu/
 │   └── hardware-notes/    (research findings, memory maps, chip notes — Phase 0+)
 ├── src/
 │   ├── cpu/
-│   │   ├── v60/
-│   │   └── z80/
+│   │   ├── v60/           (main CPU)
+│   │   ├── mb86233/       (TGP/geometrizer — real LLE core, see hardware notes)
+│   │   ├── m68000/        (sound/music board CPU)
+│   │   └── z80/           (I/O board CPU; also used for Star Wars Arcade's DSB)
 │   ├── tgp/
 │   ├── video/
 │   ├── sound/
