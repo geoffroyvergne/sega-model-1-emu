@@ -125,6 +125,16 @@ Cpu::Operand Cpu::decode_general_operand(uint32_t modifier_addr, Dim dim, bool m
                 out_length = 2;
                 return Operand{Operand::Kind::Memory, 0, regs_[regnum] + static_cast<uint32_t>(disp), 0};
             }
+            case 1: { // Displacement-16: [reg + sign-extended 16-bit displacement]
+                const auto disp = static_cast<int16_t>(bus_.read16(modifier_addr + 1));
+                out_length = 3;
+                return Operand{Operand::Kind::Memory, 0, regs_[regnum] + static_cast<uint32_t>(disp), 0};
+            }
+            case 2: { // Displacement-32: [reg + 32-bit displacement] (already full width, no sign-extension needed)
+                const uint32_t disp = bus_.read32(modifier_addr + 1);
+                out_length = 5;
+                return Operand{Operand::Kind::Memory, 0, regs_[regnum] + disp, 0};
+            }
             case 3: // Register indirect: [reg]
                 out_length = 1;
                 return Operand{Operand::Kind::Memory, 0, regs_[regnum], 0};
@@ -310,6 +320,14 @@ void Cpu::set_sub_flags(Dim dim, uint64_t result, uint32_t src, uint32_t dst) {
 void Cpu::set_logical_flags(Dim dim, uint32_t result) {
     flags_.overflow = false;
     set_szf(dim, result);
+}
+
+// Shifts a dim-width value's sign bit up to bit 31 and back down
+// arithmetically -- the same trick used in op_sha -- then widens to
+// int64_t, sign-extending correctly regardless of dim.
+int64_t Cpu::sign_extend64(uint32_t value, Dim dim) {
+    const uint32_t bits = dim_bytes(dim) * 8;
+    return static_cast<int32_t>(value << (32 - bits)) >> (32 - bits);
 }
 
 int Cpu::op_halt() {
@@ -538,6 +556,143 @@ int Cpu::op_sha(Dim dim) {
     return kApproximateCyclesPerInstruction;
 }
 
+// MUL: signed multiply. See the header comment for the confirmed overflow
+// quirk this replicates exactly rather than correcting.
+int Cpu::op_mul(Dim dim) {
+    Format12 d = decode_format12(dim, dim);
+    const uint32_t dst = read_operand(d.op2, dim);
+    const uint32_t bits = dim_bytes(dim) * 8;
+    const uint64_t product = static_cast<uint64_t>(sign_extend64(dst, dim) * sign_extend64(d.op1_value, dim));
+    const uint32_t result = read_sized(static_cast<uint32_t>(product), dim);
+
+    flags_.overflow = (product >> bits) != 0;
+    set_szf(dim, result);
+    write_operand(d.op2, dim, result);
+    pc_ += d.length;
+    return kApproximateCyclesPerInstruction;
+}
+
+// MULU: unsigned multiply -- same shape as MUL, no sign-extension, and no
+// quirk (this overflow check is exactly correct for unsigned operands).
+int Cpu::op_mulu(Dim dim) {
+    Format12 d = decode_format12(dim, dim);
+    const uint32_t dst = read_operand(d.op2, dim);
+    const uint32_t bits = dim_bytes(dim) * 8;
+    const uint64_t product = static_cast<uint64_t>(dst) * static_cast<uint64_t>(d.op1_value);
+    const uint32_t result = read_sized(static_cast<uint32_t>(product), dim);
+
+    flags_.overflow = (product >> bits) != 0;
+    set_szf(dim, result);
+    write_operand(d.op2, dim, result);
+    pc_ += d.length;
+    return kApproximateCyclesPerInstruction;
+}
+
+// DIV: signed divide. See the header comment for the two confirmed
+// quirks (divide-by-zero is a silent no-op; INT_MIN/-1 is flagged as
+// overflow and also skipped, not computed).
+int Cpu::op_div(Dim dim) {
+    Format12 d = decode_format12(dim, dim);
+    const uint32_t dst = read_operand(d.op2, dim);
+    const uint32_t src = d.op1_value;
+    const uint32_t bits = dim_bytes(dim) * 8;
+    const uint32_t min_value = 1u << (bits - 1);
+    const uint32_t all_ones = (bits == 32) ? 0xffffffffu : ((1u << bits) - 1);
+
+    flags_.overflow = (dst == min_value) && (src == all_ones);
+    uint32_t result = dst;
+    if (src != 0 && !flags_.overflow) {
+        result = read_sized(static_cast<uint32_t>(sign_extend64(dst, dim) / sign_extend64(src, dim)), dim);
+    }
+
+    set_szf(dim, result);
+    write_operand(d.op2, dim, result);
+    pc_ += d.length;
+    return kApproximateCyclesPerInstruction;
+}
+
+// DIVU: unsigned divide -- no INT_MIN/-1 case, overflow always cleared;
+// divide-by-zero is still a silent no-op.
+int Cpu::op_divu(Dim dim) {
+    Format12 d = decode_format12(dim, dim);
+    const uint32_t dst = read_operand(d.op2, dim);
+    const uint32_t src = d.op1_value;
+
+    flags_.overflow = false;
+    const uint32_t result = (src != 0) ? read_sized(dst / src, dim) : dst;
+
+    set_szf(dim, result);
+    write_operand(d.op2, dim, result);
+    pc_ += d.length;
+    return kApproximateCyclesPerInstruction;
+}
+
+// ROT: rotates the operand's own bits (mod-`bits`), no carry involved in
+// the ring. Overflow always cleared. Confirmed against the reference's
+// opROTB/opROTH/opROTW.
+int Cpu::op_rot(Dim dim) {
+    Format12 d = decode_format12(Dim::Byte, dim); // count is always Byte-sized, same gotcha as SHL/SHA
+    const int32_t count = static_cast<int8_t>(d.op1_value & 0xff);
+    const uint32_t bits = dim_bytes(dim) * 8;
+    uint32_t result = read_operand(d.op2, dim);
+
+    if (count > 0) {
+        for (int32_t i = 0; i < count; i++) {
+            const uint32_t top_bit = (result >> (bits - 1)) & 1;
+            result = read_sized((result << 1) | top_bit, dim);
+        }
+        flags_.carry = (result & 1) != 0;
+    } else if (count < 0) {
+        for (int32_t i = 0; i < -count; i++) {
+            const uint32_t bottom_bit = result & 1;
+            result = read_sized((result >> 1) | (bottom_bit << (bits - 1)), dim);
+        }
+        flags_.carry = ((result >> (bits - 1)) & 1) != 0;
+    } else {
+        flags_.carry = false;
+    }
+
+    flags_.overflow = false;
+    set_szf(dim, result);
+    write_operand(d.op2, dim, result);
+    pc_ += d.length;
+    return kApproximateCyclesPerInstruction;
+}
+
+// ROTC: like ROT, but rotates THROUGH the carry flag -- a (bits+1)-wide
+// ring where carry is an extra bit alongside the operand's own bits.
+// Confirmed against the reference's opROTCB/opROTCH/opROTCW (each bit
+// shifted out becomes the new carry, and the *old* carry becomes the bit
+// shifted in -- not the same as ROT followed by a separate carry update).
+int Cpu::op_rotc(Dim dim) {
+    Format12 d = decode_format12(Dim::Byte, dim);
+    const int32_t count = static_cast<int8_t>(d.op1_value & 0xff);
+    const uint32_t bits = dim_bytes(dim) * 8;
+    uint32_t result = read_operand(d.op2, dim);
+
+    if (count > 0) {
+        for (int32_t i = 0; i < count; i++) {
+            const bool old_carry = flags_.carry;
+            flags_.carry = ((result >> (bits - 1)) & 1) != 0;
+            result = read_sized((result << 1) | (old_carry ? 1u : 0u), dim);
+        }
+    } else if (count < 0) {
+        for (int32_t i = 0; i < -count; i++) {
+            const bool old_carry = flags_.carry;
+            flags_.carry = (result & 1) != 0;
+            result = read_sized((result >> 1) | (old_carry ? (1u << (bits - 1)) : 0u), dim);
+        }
+    } else {
+        flags_.carry = false;
+    }
+
+    flags_.overflow = false;
+    set_szf(dim, result);
+    write_operand(d.op2, dim, result);
+    pc_ += d.length;
+    return kApproximateCyclesPerInstruction;
+}
+
 // Condition codes 0-15 (11 reserved), confirmed one-for-one against
 // MAME's opBV8/opBNV8/.../opBGT8 (op4.hxx): each tests a specific flag
 // combination, matching the standard signed/unsigned comparison flag
@@ -741,6 +896,63 @@ int Cpu::op_dec(Dim dim, bool modm) {
     return kApproximateCyclesPerInstruction;
 }
 
+uint32_t Cpu::read_psw() const {
+    return (flags_.zero ? 1u : 0u) | (flags_.sign ? 2u : 0u) | (flags_.overflow ? 4u : 0u) | (flags_.carry ? 8u : 0u);
+}
+
+void Cpu::write_psw(uint32_t value) {
+    flags_.zero = (value & 1u) != 0;
+    flags_.sign = (value & 2u) != 0;
+    flags_.overflow = (value & 4u) != 0;
+    flags_.carry = (value & 8u) != 0;
+}
+
+int Cpu::op_pushm(bool modm) {
+    const uint32_t opcode_pc = pc_;
+    uint8_t modifier_length = 0;
+    const Operand operand = decode_general_operand(opcode_pc + 1, Dim::Long, modm, modifier_length);
+    const uint32_t mask = read_operand(operand, Dim::Long);
+
+    if (mask & (1u << 31)) {
+        regs_[SP] -= 4;
+        bus_.write32(regs_[SP], read_psw());
+    }
+    for (int i = 30; i >= 0; i--) {
+        if (mask & (1u << i)) {
+            regs_[SP] -= 4;
+            bus_.write32(regs_[SP], regs_[static_cast<size_t>(i)]);
+        }
+    }
+
+    pc_ = opcode_pc + 1 + modifier_length;
+    return kApproximateCyclesPerInstruction;
+}
+
+int Cpu::op_popm(bool modm) {
+    const uint32_t opcode_pc = pc_;
+    uint8_t modifier_length = 0;
+    const Operand operand = decode_general_operand(opcode_pc + 1, Dim::Long, modm, modifier_length);
+    const uint32_t mask = read_operand(operand, Dim::Long);
+
+    for (int i = 0; i <= 30; i++) {
+        if (mask & (1u << i)) {
+            regs_[static_cast<size_t>(i)] = bus_.read32(regs_[SP]);
+            regs_[SP] += 4;
+        }
+    }
+    if (mask & (1u << 31)) {
+        // Reference-confirmed asymmetry: only the low 16 bits are actually
+        // read back, even though PUSHM wrote a full dword; the current
+        // PSW's upper 16 bits are preserved rather than zeroed.
+        const uint32_t low16 = bus_.read16(regs_[SP]);
+        write_psw((read_psw() & 0xffff0000u) | low16);
+        regs_[SP] += 4;
+    }
+
+    pc_ = opcode_pc + 1 + modifier_length;
+    return kApproximateCyclesPerInstruction;
+}
+
 int Cpu::step() {
     const uint32_t opcode_pc = pc_;
     const uint8_t opcode = bus_.read8(pc_);
@@ -800,12 +1012,34 @@ int Cpu::step() {
         case 0xdb: return op_inc(Dim::Word, true);
         case 0xdc: return op_inc(Dim::Long, false);
         case 0xdd: return op_inc(Dim::Long, true);
+        case 0xe4: return op_popm(false);
+        case 0xe5: return op_popm(true);
+        case 0xec: return op_pushm(false);
+        case 0xed: return op_pushm(true);
         case 0xa9: return op_shl(Dim::Byte);
         case 0xab: return op_shl(Dim::Word);
         case 0xad: return op_shl(Dim::Long);
         case 0xb9: return op_sha(Dim::Byte);
         case 0xbb: return op_sha(Dim::Word);
         case 0xbd: return op_sha(Dim::Long);
+        case 0x81: return op_mul(Dim::Byte);
+        case 0x83: return op_mul(Dim::Word);
+        case 0x85: return op_mul(Dim::Long);
+        case 0x91: return op_mulu(Dim::Byte);
+        case 0x93: return op_mulu(Dim::Word);
+        case 0x95: return op_mulu(Dim::Long);
+        case 0xa1: return op_div(Dim::Byte);
+        case 0xa3: return op_div(Dim::Word);
+        case 0xa5: return op_div(Dim::Long);
+        case 0xb1: return op_divu(Dim::Byte);
+        case 0xb3: return op_divu(Dim::Word);
+        case 0xb5: return op_divu(Dim::Long);
+        case 0x89: return op_rot(Dim::Byte);
+        case 0x8b: return op_rot(Dim::Word);
+        case 0x8d: return op_rot(Dim::Long);
+        case 0x99: return op_rotc(Dim::Byte);
+        case 0x9b: return op_rotc(Dim::Word);
+        case 0x9d: return op_rotc(Dim::Long);
         default:
             throw UnimplementedOpcode(opcode_pc, opcode);
     }

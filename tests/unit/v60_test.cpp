@@ -62,6 +62,8 @@ uint8_t register_indirect_modifier(uint8_t reg) { return static_cast<uint8_t>((3
 uint8_t autoincrement_modifier(uint8_t reg) { return static_cast<uint8_t>((4 << 5) | (reg & 0x1f)); }
 uint8_t autodecrement_modifier(uint8_t reg) { return static_cast<uint8_t>((5 << 5) | (reg & 0x1f)); }
 uint8_t displacement8_modifier(uint8_t reg) { return static_cast<uint8_t>((0 << 5) | (reg & 0x1f)); }
+uint8_t displacement16_modifier(uint8_t reg) { return static_cast<uint8_t>((1 << 5) | (reg & 0x1f)); }
+uint8_t displacement32_modifier(uint8_t reg) { return static_cast<uint8_t>((2 << 5) | (reg & 0x1f)); }
 // "Group 7" (modm=0, top-3-bits=7): immediate modes, sub-decoded by the
 // low 5 bits. Values 0-15 are "immediate quick" (the value IS those bits);
 // 20 is a full-width immediate (extra bytes follow).
@@ -375,6 +377,66 @@ TEST_CASE("Displacement-8 offset can be negative") {
     cpu.step();
 
     CHECK(cpu.reg(R4) == 0x44);
+}
+
+TEST_CASE("Displacement-16 adds a sign-extended 16-bit offset to the register") {
+    // MOVB 0x200(R3), R4 : reads from R3 + 0x200 -- beyond what an 8-bit
+    // displacement could reach.
+    TestBus bus;
+    bus.load(0, {0x09, short_instflags(true, false, R4), displacement16_modifier(R3), 0x00, 0x02});
+    bus.write8(0x300, 0x55);
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R3, 0x100);
+
+    cpu.step();
+
+    CHECK(cpu.reg(R4) == 0x55);
+    CHECK(cpu.pc() == 5); // opcode + instflags + modifier + 2 displacement bytes
+}
+
+TEST_CASE("Displacement-16 offset can be negative") {
+    TestBus bus;
+    bus.load(0, {0x09, short_instflags(true, false, R4), displacement16_modifier(R3), 0x00, 0xff}); // -256
+    bus.write8(0x100, 0x66); // target = R3(0x200) + (-256) = 0x100, away from the program at address 0
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R3, 0x200);
+
+    cpu.step();
+
+    CHECK(cpu.reg(R4) == 0x66);
+}
+
+TEST_CASE("Displacement-16 writes through the same offset it reads from") {
+    // MOVB R4, 0x200(R3) : op2 general displacement-16, a valid write target.
+    TestBus bus;
+    bus.load(0, {0x09, short_instflags(false, false, R4), displacement16_modifier(R3), 0x00, 0x02});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R3, 0x100);
+    cpu.set_reg(R4, 0x77);
+
+    cpu.step();
+
+    CHECK(bus.read8(0x300) == 0x77);
+}
+
+TEST_CASE("Displacement-32 adds a full 32-bit offset, no sign extension needed") {
+    TestBus bus;
+    bus.load(0, {
+        0x09, short_instflags(true, false, R4), displacement32_modifier(R3),
+        0x00, 0x02, 0x00, 0x00, // 0x200, little-endian
+    });
+    bus.write8(0x300, 0x88);
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R3, 0x100);
+
+    cpu.step();
+
+    CHECK(cpu.reg(R4) == 0x88);
+    CHECK(cpu.pc() == 7); // opcode + instflags + modifier + 4 displacement bytes
 }
 
 // MOVB #5, R2 : op1 is an "immediate quick" literal (0-15), op2 short.
@@ -1236,6 +1298,324 @@ TEST_CASE("SHA left shift without a sign change reports no overflow") {
     CHECK(cpu.flags().carry == false);
 }
 
+// MULB R1, R2 : op2 = op2 * op1 (signed), read-modify-write.
+TEST_CASE("MULB multiplies two small positive values with no overflow") {
+    TestBus bus;
+    bus.load(0, {0x81, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 5);
+    cpu.set_reg(R2, 6);
+
+    cpu.step();
+
+    CHECK((cpu.reg(R2) & 0xff) == 30);
+    CHECK(cpu.flags().overflow == false);
+}
+
+TEST_CASE("MULB sets overflow for ANY negative result, even one that fits the byte perfectly") {
+    // A real, confirmed quirk (see docs/hardware-notes/07-v60-architecture.md):
+    // MUL reuses MULU's raw "are upper bits set" overflow check without
+    // accounting for sign extension, so -5 (which fits an int8 just fine)
+    // still reports overflow, because its sign-extended full-width bit
+    // pattern has nonzero upper bits.
+    TestBus bus;
+    bus.load(0, {0x81, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 5);
+    cpu.set_reg(R2, static_cast<uint32_t>(-1)); // -1 * 5 = -5
+
+    cpu.step();
+
+    CHECK(static_cast<int8_t>(cpu.reg(R2) & 0xff) == -5); // the value is genuinely correct
+    CHECK(cpu.flags().overflow == true); // ...yet overflow still fires
+}
+
+TEST_CASE("MULB genuinely overflows when the product doesn't fit a byte") {
+    TestBus bus;
+    bus.load(0, {0x81, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 20);
+    cpu.set_reg(R2, 20); // 400, doesn't fit in a byte
+
+    cpu.step();
+
+    CHECK(cpu.flags().overflow == true);
+}
+
+// MULUB R1, R2 : unsigned multiply -- same overflow check, but correct
+// here since there's no sign to mishandle.
+TEST_CASE("MULUB does not overflow for a product that fits the byte") {
+    TestBus bus;
+    bus.load(0, {0x91, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 5);
+    cpu.set_reg(R2, 6);
+
+    cpu.step();
+
+    CHECK((cpu.reg(R2) & 0xff) == 30);
+    CHECK(cpu.flags().overflow == false);
+}
+
+TEST_CASE("MULUB overflows when the unsigned product exceeds a byte") {
+    TestBus bus;
+    bus.load(0, {0x91, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 20);
+    cpu.set_reg(R2, 20);
+
+    cpu.step();
+
+    CHECK((cpu.reg(R2) & 0xff) == (400 & 0xff));
+    CHECK(cpu.flags().overflow == true);
+}
+
+// DIVB R1, R2 : op2 = op2 / op1 (signed).
+TEST_CASE("DIVB divides two values") {
+    TestBus bus;
+    bus.load(0, {0xa1, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 3);
+    cpu.set_reg(R2, 10);
+
+    cpu.step();
+
+    CHECK((cpu.reg(R2) & 0xff) == 3);
+    CHECK(cpu.flags().overflow == false);
+}
+
+TEST_CASE("DIVB by zero is a silent no-op, not a trap") {
+    // A real, confirmed quirk: division by zero leaves the destination
+    // completely unchanged rather than trapping or producing a sentinel.
+    TestBus bus;
+    bus.load(0, {0xa1, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 0);
+    cpu.set_reg(R2, 0x42);
+
+    cpu.step();
+
+    CHECK((cpu.reg(R2) & 0xff) == 0x42); // unchanged
+    CHECK(cpu.pc() == 3); // execution just continues normally
+}
+
+TEST_CASE("DIVB flags INT_MIN / -1 as overflow and skips the division") {
+    // -128 / -1 = 128, which doesn't fit in an int8 -- the one signed
+    // division case that's genuinely unrepresentable. Confirmed the
+    // reference detects this specific pair and skips dividing (same as
+    // divide-by-zero), rather than computing a wrapped/garbage result.
+    TestBus bus;
+    bus.load(0, {0xa1, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 0xff); // -1
+    cpu.set_reg(R2, 0x80); // -128 (INT8_MIN)
+
+    cpu.step();
+
+    CHECK(cpu.flags().overflow == true);
+    CHECK((cpu.reg(R2) & 0xff) == 0x80); // unchanged, division skipped
+}
+
+// DIVUB R1, R2 : unsigned divide -- no INT_MIN/-1 case, overflow always false.
+TEST_CASE("DIVUB divides unsigned values and never sets overflow") {
+    TestBus bus;
+    bus.load(0, {0xb1, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 3);
+    cpu.set_reg(R2, 0xff); // 255
+
+    cpu.step();
+
+    CHECK((cpu.reg(R2) & 0xff) == 85); // 255 / 3
+    CHECK(cpu.flags().overflow == false);
+}
+
+TEST_CASE("DIVUB by zero is also a silent no-op") {
+    TestBus bus;
+    bus.load(0, {0xb1, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 0);
+    cpu.set_reg(R2, 0x77);
+
+    cpu.step();
+
+    CHECK((cpu.reg(R2) & 0xff) == 0x77);
+}
+
+// ROTB R1, R2 : op2 rotated by op1 (signed count, same encoding as
+// SHL/SHA). Plain rotate -- no carry involved in the ring.
+TEST_CASE("ROTB rotates left, wrapping the top bit around to the bottom") {
+    TestBus bus;
+    bus.load(0, {0x89, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 1);
+    cpu.set_reg(R2, 0x81); // 10000001
+
+    cpu.step();
+
+    CHECK((cpu.reg(R2) & 0xff) == 0x03); // 00000011
+    CHECK(cpu.flags().carry == true);    // the bit that wrapped around
+}
+
+TEST_CASE("ROTB rotates right, wrapping the bottom bit around to the top") {
+    TestBus bus;
+    bus.load(0, {0x89, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, static_cast<uint32_t>(-1));
+    cpu.set_reg(R2, 0x81); // 10000001
+
+    cpu.step();
+
+    CHECK((cpu.reg(R2) & 0xff) == 0xc0); // 11000000
+    CHECK(cpu.flags().carry == true);
+}
+
+TEST_CASE("ROTB by a full byte width returns to the original value") {
+    TestBus bus;
+    bus.load(0, {0x89, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 8); // == bit width of a byte
+    cpu.set_reg(R2, 0x81);
+
+    cpu.step();
+
+    CHECK((cpu.reg(R2) & 0xff) == 0x81); // unchanged: 8 rotations is a full circle
+}
+
+// ROTCB R1, R2 : rotates THROUGH carry -- a 9-bit ring (byte + carry), not
+// the same as ROTB. The old carry becomes the bit shifted in; the bit
+// shifted out becomes the new carry.
+TEST_CASE("ROTCB brings in the OLD carry, unlike ROTB which brings in the wrapped bit") {
+    TestBus bus;
+    bus.load(0, {0x99, short_instflags(false, true, R1), register_direct_modifier(R2)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 1);
+    cpu.set_reg(R2, 0x81); // 10000001, carry starts clear (fresh reset)
+
+    cpu.step();
+
+    // Contrast with ROTB's 0x03 for the identical input: ROTC shifts in
+    // the OLD carry (0), not the bit that fell off the top (1).
+    CHECK((cpu.reg(R2) & 0xff) == 0x02); // 00000010
+    CHECK(cpu.flags().carry == true);    // the bit that fell off the top (bit 7 = 1)
+}
+
+TEST_CASE("ROTCB with carry initially set shifts a 1 in from the bottom") {
+    TestBus bus;
+    bus.load(0, {
+        0xb8, short_instflags(false, true, R3), register_direct_modifier(R4), // CMPB R3=5,R4=3 -> borrow -> carry=1
+        0x99, short_instflags(false, true, R1), register_direct_modifier(R2), // ROTCB R1,R2
+    });
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R3, 5);
+    cpu.set_reg(R4, 3);
+    cpu.set_reg(R1, 1);
+    cpu.set_reg(R2, 0x40); // 01000000
+
+    cpu.step(); // CMPB, establishes carry=1
+    CHECK(cpu.flags().carry == true);
+    cpu.step(); // ROTCB
+
+    CHECK((cpu.reg(R2) & 0xff) == 0x81); // 10000001 -- old carry (1) shifted into bit 0
+    CHECK(cpu.flags().carry == false);   // bit 7 (0) fell off the top
+}
+
+// PUSHM_1 #0b1010 : bit 1 (R1) and bit 3 (R3) selected. Confirmed order:
+// registers push in DESCENDING bit order (R3 first, then R1), so R3 ends
+// up deepest on the stack (highest address) and R1 shallowest (at the
+// final SP, since it was pushed last).
+TEST_CASE("PUSHM pushes selected registers in descending order") {
+    TestBus bus;
+    bus.load(0, {0xec, immediate_quick_modifier(0b1010)});
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 0x11111111);
+    cpu.set_reg(R3, 0x33333333);
+    cpu.set_reg(SP, 0x300);
+
+    cpu.step();
+
+    CHECK(cpu.reg(SP) == 0x2f8);
+    CHECK(bus.read32(0x2f8) == 0x11111111); // R1, pushed last -> shallowest
+    CHECK(bus.read32(0x2fc) == 0x33333333); // R3, pushed first -> deepest
+    CHECK(cpu.pc() == 2);
+}
+
+TEST_CASE("PUSHM then POPM with the same mask round-trips the selected registers") {
+    TestBus bus;
+    bus.load(0, {
+        0xec, immediate_quick_modifier(0b1010), // PUSHM #0b1010
+        0xe4, immediate_quick_modifier(0b1010), // POPM #0b1010
+    });
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R1, 0x11111111);
+    cpu.set_reg(R3, 0x33333333);
+    cpu.set_reg(SP, 0x300);
+
+    cpu.step(); // PUSHM
+    cpu.set_reg(R1, 0); // clobber, to prove POPM actually restores them
+    cpu.set_reg(R3, 0);
+    cpu.step(); // POPM
+
+    CHECK(cpu.reg(R1) == 0x11111111);
+    CHECK(cpu.reg(R3) == 0x33333333);
+    CHECK(cpu.reg(SP) == 0x300); // net zero effect on SP
+}
+
+// PUSHM/POPM with bit 31 (PSW) included -- confirms flags round-trip
+// through the save/restore. PSW packs Z/S/OV/CY into bits 0-3
+// respectively (confirmed against the reference's v60ReadPSW); using
+// equal CMPB operands gives a clean, easy-to-verify state: zero=1 and
+// everything else clear, so PSW == 1.
+TEST_CASE("PUSHM/POPM including the PSW bit saves and restores flags") {
+    TestBus bus;
+    bus.load(0, {
+        0xb8, short_instflags(false, true, R5), register_direct_modifier(R6), // CMPB R5=5,R6=5 -> zero=1, else clear
+        0xec, immediate_full_modifier(), 0x00, 0x00, 0x00, 0x80,              // PUSHM #0x80000000 (PSW only)
+        0xb8, short_instflags(false, true, R7), register_direct_modifier(R6), // CMPB R7=5,R6=3 -> carry=1, zero=0 (clobber)
+        0xe4, immediate_full_modifier(), 0x00, 0x00, 0x00, 0x80,              // POPM #0x80000000 (PSW only)
+    });
+    Cpu cpu(bus);
+    cpu.reset(0);
+    cpu.set_reg(R5, 5);
+    cpu.set_reg(R6, 5);
+    cpu.set_reg(R7, 5);
+    cpu.set_reg(SP, 0x300);
+
+    cpu.step(); // CMPB -> zero=1, carry=0
+    CHECK(cpu.flags().zero == true);
+    CHECK(cpu.flags().carry == false);
+    cpu.step(); // PUSHM PSW
+    CHECK(cpu.reg(SP) == 0x2fc);
+    CHECK(bus.read32(0x2fc) == 1); // PSW == 1: only the zero bit set
+
+    cpu.set_reg(R6, 3); // CMPB above already ran; reset R6 for the clobber step's dst
+    cpu.step(); // CMPB R7=5,R6=3 -> carry=1, zero=0 (clobbers both flags)
+    CHECK(cpu.flags().zero == false);
+    CHECK(cpu.flags().carry == true);
+    cpu.step(); // POPM PSW -> restores zero=1, carry=0
+
+    CHECK(cpu.flags().zero == true);
+    CHECK(cpu.flags().carry == false);
+    CHECK(cpu.reg(SP) == 0x300);
+}
+
 TEST_CASE("Unknown opcode throws UnimplementedOpcode") {
     TestBus bus;
     bus.load(0, {0xff});
@@ -1246,9 +1626,9 @@ TEST_CASE("Unknown opcode throws UnimplementedOpcode") {
 }
 
 TEST_CASE("An addressing mode outside this increment's scope throws UnimplementedAddressingMode") {
-    // modm=0, mode index 1 (Displacement16) -- not implemented yet.
+    // modm=0, mode index 4 (Displacement-indirect-8) -- not implemented yet.
     TestBus bus;
-    bus.load(0, {0x09, short_instflags(true, false, R1), (1 << 5) | R2});
+    bus.load(0, {0x09, short_instflags(true, false, R1), (4 << 5) | R2});
     Cpu cpu(bus);
     cpu.reset(0);
 

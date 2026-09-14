@@ -387,6 +387,105 @@ def main() -> int:
         {"PC": 0xfffffff0 + 4 + 3, "R10": 0x77, "AP": 0x9999, "SP": 0x8000},
     ))
 
+    # MULB R1, R2 -- signed multiply. The interesting case: MUL's overflow
+    # check fires for ANY negative result (a confirmed quirk -- it reuses
+    # MULU's raw "upper bits set" test without accounting for sign
+    # extension), even one that fits the destination width perfectly.
+    results.append(run(
+        "MULB sets overflow for any negative result, even one that fits the byte",
+        bytes([0x81, 0x41, 0x62]),
+        {"R1": 5, "R2": 0xffffffff},  # -1 * 5 = -5, fits an int8 fine
+        {"R2": 0xfffffffb},           # low byte = 0xfb = -5, correctly computed
+    ))
+
+    results.append(run(
+        "MULUB overflows when the unsigned product exceeds a byte",
+        bytes([0x91, 0x41, 0x62]),
+        {"R1": 20, "R2": 20},  # 400, doesn't fit a byte
+        {"R2": 400 & 0xff},
+    ))
+
+    # DIVB R1, R2 -- signed divide, division by zero is a silent no-op.
+    results.append(run(
+        "DIVB by zero is a silent no-op, not a trap",
+        bytes([0xa1, 0x41, 0x62]),
+        {"R1": 0, "R2": 0x42},
+        {"R2": 0x42},
+    ))
+
+    # DIVB's INT_MIN/-1 case: flagged and skipped, not computed.
+    results.append(run(
+        "DIVB flags INT_MIN / -1 and skips the division",
+        bytes([0xa1, 0x41, 0x62]),
+        {"R1": 0xff, "R2": 0x80},  # -1, -128
+        {"R2": 0x80},              # unchanged
+    ))
+
+    results.append(run(
+        "DIVUB divides unsigned values",
+        bytes([0xb1, 0x41, 0x62]),
+        {"R1": 3, "R2": 0xff},
+        {"R2": 85},
+    ))
+
+    # ROTB R1, R2 -- plain rotate, carry = the wrapped bit.
+    results.append(run(
+        "ROTB rotates left, wrapping the top bit around to the bottom",
+        bytes([0x89, 0x41, 0x62]),
+        {"R1": 1, "R2": 0x81},
+        {"R2": 0x03},
+    ))
+
+    # ROTCB R1, R2 -- rotates THROUGH carry (a 9-bit ring), contrasted
+    # directly against ROTB's 0x03 result for the identical input: the OLD
+    # carry (0, fresh from reset) is shifted in, not the wrapped bit.
+    results.append(run(
+        "ROTCB shifts in the old carry, unlike ROTB which shifts in the wrapped bit",
+        bytes([0x99, 0x41, 0x62]),
+        {"R1": 1, "R2": 0x81},
+        {"R2": 0x02},
+    ))
+
+    # PUSHM_0 #0b1010 -- pushes R1 and R3 in DESCENDING order (R3 first,
+    # deepest; R1 last, shallowest -- ends up at the final SP).
+    results.append(run(
+        "PUSHM pushes selected registers in descending order",
+        bytes([0xec, 0xea]),  # immediate-quick(0b1010) = (7<<5)|0b1010 = 0xea
+        {"R1": 0x11111111, "R3": 0x33333333, "SP": 0x8000},
+        {"SP": 0x7ff8},
+    ))
+
+    # PUSHM, then clobber R1/R3 to 0 (MOVB #0), then POPM with the same
+    # mask -- proves POPM actually restores them rather than the test
+    # being trivially true because nothing touched the registers.
+    results.append(run(
+        "PUSHM then POPM round-trips the selected registers (clobbered in between)",
+        bytes([
+            0xec, 0xea,             # PUSHM #0b1010
+            0x09, 0x21, 0xe0,       # MOVB #0, R1
+            0x09, 0x23, 0xe0,       # MOVB #0, R3
+            0xe4, 0xea,             # POPM #0b1010
+        ]),
+        {"R1": 0x11111111, "R3": 0x33333333, "SP": 0x8000},
+        {"R1": 0x11111111, "R3": 0x33333333, "SP": 0x8000},
+    ))
+
+    # Displacement-16 round-trip: MOVB R1, 0x200(R3) then MOVB 0x200(R3), R2
+    # -- write through a 16-bit-displacement address, then read it back,
+    # since the harness has no way to pre-seed arbitrary memory directly.
+    # Followed by a self-loop (the harness needs an explicit stop).
+    disp16_prog = bytes([
+        0x09, 0x01, 0x23, 0x00, 0x02,  # MOVB R1, 0x200(R3)
+        0x09, 0x22, 0x23, 0x00, 0x02,  # MOVB 0x200(R3), R2
+        0x6a, 0x00,                    # BR8 +0 ; spin
+    ])
+    results.append(run(
+        "Displacement-16 write-then-read round-trips through the same address",
+        disp16_prog,
+        {"R1": 0x42, "R3": 0x100, "R2": 0},
+        {"R2": 0x42},
+    ))
+
     # JMP #0 -- JMP hardcodes a Byte-sized operand decode regardless of
     # addressing mode (confirmed against the reference's opJMP, which
     # always passes moddim=0), so even a "full" immediate here reads only

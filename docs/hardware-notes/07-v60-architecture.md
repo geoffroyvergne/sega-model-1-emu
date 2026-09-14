@@ -539,24 +539,171 @@ Validated against the real oracle, including the overflow quirk itself
 (observed indirectly via a `BV8` branch into one of two marker blocks,
 the same technique proven for CMPB+BE8): 26/26 current oracle total.
 
+## MUL/DIV: a real quirk carried over from copy-pasted overflow logic, and two "no trap" behaviors
+
+Confirmed against `op12.hxx`'s `opMULB`/`opMULUB`/`opDIVB`/`opDIVUB` (and
+H/W forms) — `MUL`=`0x81`/`0x83`/`0x85`, `MULU`=`0x91`/`0x93`/`0x95`,
+`DIV`=`0xA1`/`0xA3`/`0xA5`, `DIVU`=`0xB1`/`0xB3`/`0xB5`. All four are
+read-modify-write on operand 2, the same shape as ADD/SUB, so no new
+decode work was needed.
+
+**Real quirk, replicated exactly rather than corrected**: MUL's (signed)
+overflow check is the literal same "are any bits above the destination
+width set" test that MULU (unsigned) uses — computed on the full-width
+product without re-checking that a sign-extended negative result's upper
+bits are *supposed* to be set. The practical effect: MUL's overflow flag
+fires for **almost any negative result**, even ones that fit the
+destination perfectly (`-5` in a byte, confirmed both in unit tests and
+against the real oracle). This looks like the unsigned overflow check was
+reused for the signed instruction without accounting for sign extension —
+whether that's a genuine silicon quirk or just how this particular
+software reference behaves, we replicate it exactly, since matching
+confirmed behavior is the point, not "fixing" something that isn't
+provably broken.
+
+**Two "doesn't trap" behaviors for DIV/DIVU**, both confirmed directly:
+- **Division by zero is a silent no-op** — the destination is left
+  completely unchanged (sign/zero flags still get recomputed from that
+  unchanged value), not a crash, not a sentinel value.
+- **DIV (signed) specifically detects `INT_MIN / -1`** (the one signed
+  division whose true result doesn't fit back in the same width) and
+  **skips the division** for that case too, flagging overflow instead of
+  computing a wrapped/garbage result. DIVU (unsigned) has no equivalent
+  case and always clears overflow.
+
+`DIVX` (opcode `0xA6`, a wider-dividend variant per the file's own header
+comment: "the second operand should be treated as dword instead of word")
+is not yet implemented.
+
+Validated against the real oracle, including the overflow quirk itself:
+32/32 current oracle total.
+
+## ROT/ROTC: a stale comment, and a genuine (bits+1)-wide rotate
+
+Confirmed against `op12.hxx`'s `opROTB`/`opROTCB` (and H/W forms) —
+`ROT`=`0x89`/`0x8B`/`0x8D`, `ROTC`=`0x99`/`0x9B`/`0x9D`. Same signed-count
+encoding as SHL/SHA (positive=left, negative=right, count always
+Byte-sized regardless of the operand's own width — confirmed again here,
+consistent with the same gotcha already documented for SHL/SHA).
+
+**A stale comment, worth flagging so it doesn't mislead anyone reading the
+reference source directly**: `op12.hxx`'s own top-of-file comment lists
+`ROTC` under "Unimplemented opcodes" — but `opROTCB`/`H`/`W` are all
+present, complete, and marked `/* TRUSTED */`. Comments drift from code
+over a project's lifetime; this is a reminder to verify against the actual
+function body, not just a nearby comment, even in a well-maintained
+reference.
+
+**ROT and ROTC are genuinely different operations, not variations on a
+theme**: ROT rotates only the operand's own bits (a mod-`bits` ring). ROTC
+rotates *through* the carry flag — a `(bits+1)`-wide ring where carry is an
+extra bit alongside the operand. Concretely: for a left rotation, ROT
+shifts in whatever bit just fell off the top (so the value's own bits
+simply cycle); ROTC instead shifts in the *previous* carry value, and only
+afterward does the bit that fell off become the *new* carry. The same
+input (`0x81` rotated left by 1) gives `0x03` under ROT but `0x02` under
+ROTC (confirmed identical result both in unit tests and against the real
+oracle) — a real, non-obvious difference between what look like closely
+related mnemonics.
+
+Implemented as a direct per-bit loop mirroring the reference's own loop
+structure (not a derived closed-form shortcut) — correctness over
+cleverness, consistent with this project's interpreter-first approach; the
+loop runs at most 127 times (the largest representable signed count) per
+instruction, negligible for an interpreter regardless of how hot the path
+gets later.
+
+Validated against the real oracle: 34/34 current oracle total.
+
+## PUSHM/POPM: bit 31 is repurposed for PSW, and a real read-width asymmetry
+
+Confirmed against `op3.hxx`'s `opPUSHM`/`opPOPM` — `PUSHM`=`0xEC`/`0xED`,
+`POPM`=`0xE4`/`0xE5`. Same no-instflags single-operand shape as PUSH/POP,
+but the operand is read as a **bitmask** rather than a value to move
+directly.
+
+- **Bit 31 selects PSW**, not register 31 (SP) — there is no way to
+  include SP itself in a PUSHM/POPM list, which makes sense (SP is what's
+  doing the pushing/popping). **Bits 0-30 select registers 0-30**, i.e.
+  R0-R28, AP, and FP in this project's `Reg` numbering.
+- **PUSHM pushes PSW first** (if selected), **then registers in
+  descending order** (30 down to 0) — confirmed by the reference's loop
+  order. **POPM pops registers in ascending order** (0 up to 30) **first,
+  then PSW last** — the mirror image, matching how PUSHM laid them out
+  (the register pushed *last* by PUSHM sits at the current SP and is
+  popped *first*).
+- **A real, confirmed asymmetry**: PUSHM writes PSW as a full 32-bit dword
+  (`write_dword_unaligned`), but POPM reads only the **low 16 bits** back
+  (`read_word_unaligned`) — while still advancing SP by a full 4 bytes to
+  match the push. The current PSW's upper 16 bits are preserved rather
+  than zeroed. Replicated exactly. (This asymmetry has no test-observable
+  effect in this core specifically, since only bits 0-3 of PSW are modeled
+  at all — see below — so a 16-bit vs. 32-bit read can't actually produce
+  different flag outcomes here; it's implemented faithfully regardless,
+  since a future game or a wider PSW model could depend on it.)
+
+**PSW itself is modeled minimally, matching this project's stated scope**:
+only the four flag bits (confirmed against the reference's
+`v60ReadPSW`/`v60WritePSW`: bit 0 = zero, bit 1 = sign, bit 2 = overflow,
+bit 3 = carry). Everything above bit 3 (privilege level, interrupt state,
+...) is out of scope for a game-ROM interpreter and always reads as 0 here
+— consistent with this file's earlier note on system/privileged registers.
+
+Validated against the real oracle: descending push order and a full
+PUSHM+POPM round-trip (with an explicit clobber in between to prove
+restoration actually happened, not just that nothing touched the
+registers) both match exactly (36/36 current oracle total).
+
+## Displacement-16/32: the addressing-mode table's remaining gaps closed easily
+
+Confirmed against `am1.hxx`/`am3.hxx`'s `Displacement16`/`Displacement32`
+functions: exactly the same shape as the already-implemented
+Displacement-8 (`[reg + displacement]`), just a wider displacement field —
+16-bit sign-extended, or a full 32-bit value that needs no sign extension
+since it's already the whole width. Slotted directly into the existing
+`decode_general_operand`/`Operand` machinery as two more `case`s (modm=0,
+top-3-bits 1 and 2) — no new concepts needed, unlike almost everything
+implemented since the initial addressing-mode table correction.
+
+This closes the practical addressing-range gap that mattered most: 8-bit
+displacement caps offsets at -128..127, too small for many real struct
+or stack-frame field accesses; every instruction that already uses general
+operands (MOV, CMP, ADD, SUB, and everything else built on
+`decode_general_operand`) can now reach a full 32-bit offset from a base
+register, not just a one-byte-instruction addition.
+
+One test-writing lesson from this increment, not a CPU bug: two new unit
+tests initially collided with either the loaded program bytes (writing
+test data to address 0, which is also where the instructions themselves
+live) or the default `TestBus`'s size (writing past its 4KB bound) —
+caught immediately by the test framework itself (a wrong value read back,
+and a `vector` out-of-range exception respectively), fixed by choosing
+addresses that don't overlap the program or exceed the bus size.
+
+Validated against the real oracle via a write-then-read round-trip through
+a displacement-16 address (the harness has no way to pre-seed arbitrary
+memory directly, so round-tripping is how it's checked): 37/37 current
+oracle total.
+
 ## Scope deliberately deferred (not yet implemented)
 
-- Displacement-16/32, displacement-indirect (8/16/32), double-displacement,
-  "Group 6" (register-relative extended encoding), PC-relative addressing,
-  absolute "direct address," and bit-string/bit-field modes — each throws
-  `UnimplementedAddressingMode` for now. (Immediate literals — Group 7's
-  quick and full-width sub-modes — *are* implemented; see above.)
+- Displacement-indirect (8/16/32), double-displacement, "Group 6"
+  (register-relative extended encoding), PC-relative addressing, absolute
+  "direct address," and bit-string/bit-field modes — each throws
+  `UnimplementedAddressingMode` for now. (Displacement-8/16/32 and
+  immediate literals — Group 7's quick and full-width sub-modes — *are*
+  implemented; see above.)
 - The "both operands general" case (instflags bit 7 set) for
   `decode_format12` (value-reading instructions: MOV/CMP/ADD/SUB/AND/OR/
   XOR/NOT/SHL/SHA) — still throws `UnimplementedAddressingMode` there.
   `decode_format12_raw` (used only by CALL so far) *does* support it — see
   the call/return section above.
 - Everything else in the ~200-opcode instruction set beyond
-  HALT/NOP/MOV/CMP/ADD/SUB/AND/OR/XOR/NOT/PUSH/POP/INC/DEC/SHL/SHA/CALL/
-  the 15 conditional branches/JMP/JSR/RSR/RET — multiply/divide, rotates,
-  string/bit-field instructions, PUSHM/POPM (push/pop multiple registers
-  via a bitmask) and PREPARE (stack-frame setup for CALL's convention),
-  interrupts and system/privileged instructions.
+  HALT/NOP/MOV/CMP/ADD/SUB/AND/OR/XOR/NOT/PUSH/POP/PUSHM/POPM/INC/DEC/SHL/
+  SHA/MUL/MULU/DIV/DIVU/ROT/ROTC/CALL/the 15 conditional branches/
+  JMP/JSR/RSR/RET — **DIVX** specifically (see the MUL/DIV section above),
+  string/bit-field instructions, and PREPARE (stack-frame setup for CALL's
+  convention), interrupts and system/privileged instructions.
 - Interrupts, exceptions, privilege levels, the system/control register
   bank, memory protection/paging — all likely irrelevant to a game ROM
   running in whatever mode the boot code sets up, but not yet confirmed;

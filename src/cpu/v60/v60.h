@@ -158,8 +158,10 @@ private:
     //
     // Supported so far (modm, top-3-bits) -> mode:
     //   (0, 0) displacement-8       (1, 3) register-direct
-    //   (0, 3) register-indirect    (1, 4) autoincrement
-    //   (0, 7) "Group 7" -- only    (1, 5) autodecrement
+    //   (0, 1) displacement-16      (1, 4) autoincrement
+    //   (0, 2) displacement-32      (1, 5) autodecrement
+    //   (0, 3) register-indirect
+    //   (0, 7) "Group 7" -- only
     //          its immediate sub-modes are implemented (see below)
     //
     // Group 7 (modm=0, top-3-bits=7) is itself sub-decoded by the
@@ -220,6 +222,11 @@ private:
     void set_sub_flags(Dim dim, uint64_t result, uint32_t src, uint32_t dst);
     void set_szf(Dim dim, uint64_t result);
 
+    // Sign-extends a dim-width value (already zero-extended into the low
+    // bits of a uint32_t, as read_operand/op1_value always are) out to a
+    // full 64-bit signed value. Shared by MUL/DIV's signed forms.
+    static int64_t sign_extend64(uint32_t value, Dim dim);
+
     // AND/OR/XOR/NOT flags, confirmed against the reference core's
     // ANDB/ORB/XORB/NOTB macros: overflow is always cleared, sign/zero set
     // from the result as usual -- but unlike add/sub, carry is left
@@ -266,6 +273,53 @@ private:
     // against the reference core's opSHAB/opSHAH/opSHAW.
     int op_sha(Dim dim);
 
+    // MUL/MULU: read-modify-write on operand 2, same shape as ADD/SUB.
+    // The full-width product is computed and truncated into the
+    // destination; overflow is set if the product doesn't fit that width.
+    //
+    // Real, confirmed quirk in MUL (the SIGNED form), replicated exactly
+    // rather than "corrected": the reference's overflow check is the
+    // literal same "are any bits above the destination width set" test as
+    // MULU (the unsigned form) uses -- but a sign-extended negative
+    // product always has its upper bits set, so MUL's overflow flag fires
+    // for essentially any negative result, even ones that fit the
+    // destination width perfectly fine (e.g. -5 in a byte). Confirmed
+    // against the reference's opMULB/opMULUB (and H/W forms).
+    int op_mul(Dim dim);
+    int op_mulu(Dim dim);
+
+    // DIV/DIVU: read-modify-write on operand 2. Two real, confirmed
+    // quirks:
+    //   - Division by zero does NOT trap -- the destination is simply
+    //     left unchanged (sign/zero flags still get recomputed from that
+    //     unchanged value).
+    //   - DIV (signed) sets overflow specifically for the INT_MIN / -1
+    //     case (the one signed division that can't be represented), and
+    //     skips the division entirely when it detects that case, exactly
+    //     like the divide-by-zero path. DIVU (unsigned) has no such case
+    //     and always clears overflow.
+    // Confirmed against the reference's opDIVB/opDIVUB (and H/W forms).
+    // DIVX (a wider dividend/divisor variant, opcode 0xA6) is not yet
+    // implemented.
+    int op_div(Dim dim);
+    int op_divu(Dim dim);
+
+    // ROT/ROTC: same signed-count encoding as SHL/SHA (positive = left,
+    // negative = right), but genuinely rotating rather than shifting.
+    // ROT rotates the operand's own bits only (a mod-`bits` rotation).
+    // ROTC rotates *through* the carry flag -- a (bits+1)-wide ring
+    // including carry as an extra bit -- confirmed against the reference's
+    // opROTB/opROTCB (both marked "TRUSTED", despite an unrelated stale
+    // header comment elsewhere in the file listing "ROTC" as
+    // unimplemented). Both are implemented here as a direct per-bit loop
+    // mirroring the reference's own loop structure exactly, rather than a
+    // derived closed-form shortcut -- correctness over speed, consistent
+    // with this project's interpreter-first approach; the loop only ever
+    // runs up to 127 iterations (the largest representable count) per
+    // instruction, cheap for an interpreter regardless.
+    int op_rot(Dim dim);
+    int op_rotc(Dim dim);
+
     // JMP/JSR/RET decode a single operand directly at PC+1 -- there is no
     // instflags byte for these (unlike Format-1/2 instructions); `modm` is
     // fixed per opcode (the reference core has separate 0x_0/0x_1 opcode
@@ -304,6 +358,34 @@ private:
     // macro as opADDB/opSUBB with a constant operand of 1.
     int op_inc(Dim dim, bool modm);
     int op_dec(Dim dim, bool modm);
+
+    // PSW as a packed 32-bit value: only the low 4 bits (Z/S/OV/CY, in
+    // that bit order) are modeled -- confirmed against the reference's
+    // v60ReadPSW/v60WritePSW for the flag bits specifically. Higher PSW
+    // bits (privilege level, interrupt state, ...) are out of scope for
+    // this core (see docs/hardware-notes/07-v60-architecture.md) and
+    // always read as 0. Used only by PUSHM/POPM's PSW bit.
+    uint32_t read_psw() const;
+    void write_psw(uint32_t value);
+
+    // PUSHM/POPM: single Long-sized general operand at PC+1 (same
+    // no-instflags shape as PUSH/POP), read as a bitmask rather than a
+    // value to push/pop directly. Bit 31 selects PSW; bits 0-30 select
+    // registers 0-30 (R0-R28, AP, FP -- SP itself, register 31, has no
+    // bit, since bit 31 is repurposed for PSW instead). Confirmed against
+    // the reference's opPUSHM/opPOPM:
+    //   - PUSHM pushes PSW FIRST (if selected), then registers in
+    //     DESCENDING order (30 down to 0).
+    //   - POPM pops registers in ASCENDING order (0 up to 30) first, then
+    //     PSW LAST -- the mirror image, matching how PUSHM laid them out
+    //     on the stack.
+    //   - Real, confirmed asymmetry: PUSHM writes a full 32-bit dword for
+    //     PSW, but POPM reads back only the low 16 bits of it (preserving
+    //     the current PSW's upper 16 bits) while still advancing SP by a
+    //     full 4 bytes to match. Replicated exactly, not "fixed" to read
+    //     a full dword.
+    int op_pushm(bool modm);
+    int op_popm(bool modm);
 };
 
 } // namespace model1::cpu::v60

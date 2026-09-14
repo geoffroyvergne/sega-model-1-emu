@@ -57,17 +57,22 @@ implementation tracks, no parity despite naming, see
 `docs/hardware-notes/07-v60-architecture.md`), a `Bus` interface, and a
 correct, unit-tested instruction/addressing-mode slice: HALT, NOP,
 MOV(B/H/W), CMP(B/H/W), ADD(B/H/W), SUB(B/H/W), AND/OR/XOR/NOT(B/H/W),
-INC/DEC(B/H/W), SHL(B/H/W), SHA(B/H/W), all 15 conditional branches
-(BV/BNV/BL/BNL/BE/BNE/BNH/BH/BN/BP/BR/BLT/BGE/BLE/BGT, each in 8-bit and
-16-bit displacement form), JMP/JSR/RSR/RET, CALL, and PUSH/POP — over
-register-direct, register-indirect, autoincrement, autodecrement,
-8-bit-displacement, and **immediate** (both "quick" 0-15 literals and
+INC/DEC(B/H/W), SHL(B/H/W), SHA(B/H/W), MUL/MULU/DIV/DIVU(B/H/W),
+ROT/ROTC(B/H/W), all 15 conditional branches (BV/BNV/BL/BNL/BE/BNE/BNH/BH/
+BN/BP/BR/BLT/BGE/BLE/BGT, each in 8-bit and 16-bit displacement form),
+JMP/JSR/RSR/RET, CALL, PUSH/POP, and PUSHM/POPM — over register-direct,
+register-indirect, autoincrement, autodecrement, **8/16/32-bit
+displacement**, and **immediate** (both "quick" 0-15 literals and
 full-width literals) addressing. **Both of the V60's call/return
-conventions are now implemented, and the CPU can load a constant, do
-bitwise logic and both logical and arithmetic bit shifts, execute a loop,
-an if-statement, and save/restore registers across a call** — not just
-straight-line arithmetic on values already in registers. 80 unit tests
-pass (doctest, vendored in `third_party/`).
+conventions are implemented, the CPU can load a constant, do bitwise logic
+and arithmetic, both logical and arithmetic bit shifts, rotate (plain and
+through carry), multiply and divide, execute a loop, an if-statement, and
+save/restore either individual registers or a whole bitmask of them
+(including flags) across a call, and every general operand can now reach a
+full 32-bit offset from a base register, not just ±127 bytes** — a
+genuinely capable general-purpose instruction set at this point, not just
+straight-line toy arithmetic. 102 unit tests pass (doctest, vendored in
+`third_party/`).
 
 Adding ADD/SUB needed zero new addressing-mode code — they're
 read-modify-write on operand 2, and the `Operand` abstraction built for
@@ -86,11 +91,11 @@ All confirmed in `docs/hardware-notes/07-v60-architecture.md`.
 tests against that reading** — `tools/oracle-harness/` now runs real V60
 machine-code snippets through an actual MAME `v60_device` (no game ROM
 needed: just a minimal standalone driver) and checks the results against
-the same expectations as our unit tests. Current result: **27/27 test
+the same expectations as our unit tests. Current result: **37/37 test
 programs match the reference core exactly**, across MOV, CMP, ADD/SUB
-(including wraparound), AND/OR/XOR/NOT, INC/DEC, SHL, SHA, both branch
-outcomes, JSR, CALL/RET, PUSH/POP, and both immediate addressing modes.
-Building this
+(including wraparound), AND/OR/XOR/NOT, INC/DEC, SHL, SHA, MUL/MULU/
+DIV/DIVU, ROT/ROTC, PUSHM/POPM, both branch outcomes, JSR, CALL/RET,
+PUSH/POP, displacement-16, and both immediate addressing modes. Building this
 also surfaced two more real, confirmed hardware facts (this configuration's
 24-bit address masking, and that the PC register displays a raw/unmasked
 value even though bus accesses are masked) — see the hardware note.
@@ -121,7 +126,36 @@ bare register, the "one general, one short" decode shape everything else
 uses so far would make CALL permanently unusable — some real encoding
 needed the "both operands general" case (instflags bit 7), so that was
 added too, scoped only to CALL's dedicated raw-operand decoder rather than
-generally. This was worth doing now, while the core is still small: the addressing-mode
+generally. **MUL surfaced a similar copy-paste-shaped quirk**: its
+overflow check is the literal same "are upper bits set" test MULU
+(unsigned) uses, applied without re-checking sign extension — so MUL's
+overflow flag fires for almost any negative result, even ones that fit the
+destination perfectly (`-5` in a byte), confirmed both in unit tests and
+against the real oracle. DIV/DIVU separately confirmed two "doesn't trap"
+behaviors: division by zero silently leaves the destination unchanged, and
+signed DIV specifically detects `INT_MIN / -1` (the one unrepresentable
+signed division) and skips computing it, flagging overflow instead.
+**ROT/ROTC caught a stale comment in the reference source itself**: its
+own top-of-file comment lists ROTC as unimplemented, but the actual
+functions are complete and marked "TRUSTED" — a reminder to verify against
+the function body, not a nearby comment, even in a well-regarded
+reference. ROT and ROTC also turned out to be genuinely different
+operations, not variations on a theme: ROT rotates only the operand's own
+bits, ROTC rotates through a `(bits+1)`-wide ring that includes the carry
+flag, so identical input produces different results (`0x81` rotated left
+by 1 gives `0x03` under ROT but `0x02` under ROTC) — confirmed both ways
+against the real oracle. **PUSHM/POPM confirmed bit 31 is repurposed for
+PSW** (not SP, which has no bit of its own since it's what's doing the
+pushing/popping), that PUSHM pushes PSW first then registers in
+descending order while POPM pops registers ascending then PSW last (the
+mirror image), and a real asymmetry where POPM only reads back 16 of the
+32 bits PUSHM wrote for PSW. **Displacement-16/32 slotted in with no new
+concepts needed** — same shape as the already-implemented displacement-8,
+just a wider field — closing the addressing-range gap that mattered most
+(8-bit displacement's ±127 byte range is too small for many real
+struct/stack-frame accesses); two of its own unit tests briefly collided
+with the loaded program bytes and the test bus's size limit, caught
+immediately by the test framework itself. This was worth doing now, while the core is still small: the addressing-mode
 bugs already found this phase were "internally consistent with our
 own tests, but wrong" — exactly the failure mode oracle comparison is
 positioned to catch that more unit tests against our own understanding
@@ -164,6 +198,36 @@ Racing's boot ROM.
 **Exit criterion:** CPU reaches the same "steady state" point in boot code
 (e.g. start of the self-test loop, or wherever it legitimately waits for
 video/IO that doesn't exist yet) as the oracle does, verified by trace diff.
+
+**Status:** started. `src/bus/model1_bus.{h,cpp}` implements the full main
+CPU address map fetched directly from MAME's `model1_mem()` (a more
+precise source than the summarized table Phase 0 originally produced —
+see `docs/hardware-notes/08-bus-and-rom-loading.md`), with real, confirmed
+logic (not stubs) for ROM regions, ROMO bank switching, and the
+main-CPU-facing half of the TGP RAM interface — everything whose behavior
+was already fully understood — and clearly-marked stubs for whatever
+belongs to a later phase (video, sound, the TGP FIFO handshake, real
+interrupts). `src/board/rom_set.{h,cpp}` implements generic ROM loading
+and CRC32/size validation, and `src/board/games/virtua_racing.{h,cpp}`
+records Virtua Racing's real ROM file layout (names/sizes/checksums, as
+fingerprints only) for the regions this phase covers.
+
+**Blocked on real ROMs for the actual exit criterion** (executing real
+boot code) — this project doesn't have, and won't seek, any game ROM (see
+the legal doc). What's built so far is fully exercised by 19 new unit
+tests against synthetic data instead, and is ready to load a real dump the
+moment one is available.
+
+Building the TGP RAM interface surfaced a real bug, caught by a unit test
+rather than by inspection: that register is genuinely 16-bit-wide in
+hardware, and this bus's usual approach (build 16-bit access generically
+from two 8-bit accesses) silently double-triggered its side effects (the
+auto-increment) when applied to it, corrupting the second byte of a write
+and advancing the address twice instead of once. Fixed by making
+`read16`/`write16` the primary handlers for that specific register instead
+of the other way around — worth remembering as more real-behavior
+registers get added to this bus: check whether a register's *actual*
+hardware width matters before assuming byte-level decomposition is free.
 
 ## Phase 3 — Minimal video: tile/sprite layer (est. 4–6 weeks)
 

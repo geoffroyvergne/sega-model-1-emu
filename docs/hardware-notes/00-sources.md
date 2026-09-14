@@ -79,6 +79,14 @@ hardware facts — not copied into this project's code.
   Phase 6 implementation, not just the display-list opcode dispatch around
   it.
 
+- **MAME source, `model1_mem()`/`model1_io()` in `model1.cpp`** — the exact
+  main-CPU address map, fetched directly (not summarized) for Phase 2's
+  bus implementation. See `08-bus-and-rom-loading.md`.
+- **MAME source, `model1.cpp`'s `bank_w`** — ROMO bank-switching register
+  logic.
+- **MAME source, `model1.cpp`'s `ROM_START( vr )`** — Virtua Racing's real
+  ROM file layout (names/sizes/CRC32, used as fingerprints only).
+
 ## Local MAME checkout — the oracle is built and confirmed working
 
 A shallow clone of `mamedev/mame` (`master`, depth 1) was pulled into the
