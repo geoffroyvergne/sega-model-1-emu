@@ -178,6 +178,228 @@ def main() -> int:
         {"PC": RESET_VECTOR + 2 + 3, "R10": 0x77},
     ))
 
+    # MOVB #5, R2 -- op1 is an "immediate quick" literal (Group 7, modm=0,
+    # sub-index 0-15: the value IS those bits, no extra bytes).
+    results.append(run(
+        "Immediate-quick loads a small constant with no extra bytes",
+        bytes([0x09, 0x21, 0xe5]),  # instflags: op1 general, modm=0, op2 short R1
+        {"R1": 0xff},
+        {"R1": 5},
+    ))
+
+    # MOVW #0xdeadbeef, R2 -- full-width immediate (Group 7 sub-index 20),
+    # long-sized, 4 extra bytes follow the modifier.
+    results.append(run(
+        "Full immediate reads a dim-sized literal following the modifier",
+        bytes([0x2d, 0x21, 0xf4, 0xef, 0xbe, 0xad, 0xde]),
+        {"R1": 0},
+        {"R1": 0xdeadbeef},
+    ))
+
+    # ANDB R1, R2 -- op2 = op2 & op1; overflow cleared, carry untouched.
+    results.append(run(
+        "ANDB masks bits and clears overflow",
+        bytes([0xa0, 0x41, 0x62]),
+        {"R1": 0x0f, "R2": 0xff},
+        {"R2": 0x0f},
+    ))
+
+    # ORB R1, R2 -- op2 = op2 | op1.
+    results.append(run(
+        "ORB sets bits",
+        bytes([0x88, 0x41, 0x62]),
+        {"R1": 0x0f, "R2": 0xf0},
+        {"R2": 0xff},
+    ))
+
+    # XORB R1, R2 -- op2 = op2 ^ op1.
+    results.append(run(
+        "XORB toggles bits to zero",
+        bytes([0xb0, 0x41, 0x62]),
+        {"R1": 0xff, "R2": 0xff},
+        {"R2": 0x00},
+    ))
+
+    # NOTB R1, R2 -- op2 = ~op1, byte-sized (preserves R2's upper bits).
+    results.append(run(
+        "NOTB writes the bitwise complement of the source",
+        bytes([0x38, 0x41, 0x62]),
+        {"R1": 0x0f, "R2": 0xffffff00},
+        {"R2": 0xfffffff0},
+    ))
+
+    # PUSH R1 then POP R2 -- round-trips a value through the stack, net
+    # zero effect on SP.
+    results.append(run(
+        "PUSH then POP round-trips a value through the stack",
+        bytes([0xef, 0x62, 0xe7, 0x63]),  # PUSH R2 ; POP R3 (register_direct(2), register_direct(3))
+        {"R2": 0x12345678, "SP": 0x8000},
+        {"R3": 0x12345678, "SP": 0x8000},
+    ))
+
+    # PUSH of an immediate pushes the FULL 32-bit value -- PUSH hardcodes a
+    # Long-sized operand decode regardless of addressing mode (confirmed
+    # against the reference's opPUSH: "m_moddim = 2" unconditionally).
+    results.append(run(
+        "PUSH of an immediate pushes the full 32-bit value, then POP reads it back",
+        bytes([0xee, 0xe5, 0xe7, 0x62]),  # PUSH #5 (immediate-quick) ; POP R2
+        {"SP": 0x8000},
+        {"R2": 5, "SP": 0x8000},
+    ))
+
+    # INCB_1 R1 -- single-operand read-modify-write, +1, full ADD-style
+    # flags (unlike AND/OR/XOR/NOT, INC/DEC DO set carry).
+    results.append(run(
+        "INCB sets carry on overflow past a byte",
+        bytes([0xd9, 0x62]),  # register_direct(R2)
+        {"R2": 0xff},
+        {"R2": 0x00},
+    ))
+
+    # DECB_0 [R3] -- register-indirect (modm=0 via opcode 0xd0, mode index
+    # 3): confirms INC/DEC work through memory addressing, not just
+    # register-direct, by checking R3 itself is untouched (the harness
+    # only reads back registers/PC, not arbitrary memory, so the indirect
+    # write itself is covered by tests/unit/v60_test.cpp instead).
+    results.append(run(
+        "DECB through register-indirect leaves the address register itself untouched",
+        bytes([0xd0, 0x63]),
+        {"R3": 0x1234},
+        {"R3": 0x1234},
+    ))
+
+    # SHLB R1, R2 -- op1 is a signed count (positive=left, negative=right,
+    # both LOGICAL/zero-fill). Positive count: shift left, carry = last
+    # bit shifted out.
+    results.append(run(
+        "SHL with a positive count shifts left and sets carry",
+        bytes([0xa9, 0x41, 0x62]),
+        {"R1": 1, "R2": 0x81},
+        {"R2": 0x02},
+    ))
+
+    # Negative count: shift right LOGICALLY (zero-fill), not arithmetically.
+    results.append(run(
+        "SHL with a negative count shifts right logically, not arithmetically",
+        bytes([0xa9, 0x41, 0x62]),
+        {"R1": 0xffffffff, "R2": 0x81},  # count = -1
+        {"R2": 0x40},
+    ))
+
+    # SHLH: the count operand (op1) is always Byte-sized even for the
+    # 16-bit form -- confirmed against the reference's F12DecodeOperands
+    # call, which hardcodes a literal 0 for op1's dim regardless of dim2.
+    results.append(run(
+        "SHLH shifts a 16-bit operand with a byte-sized count",
+        bytes([0xab, 0x41, 0x62]),
+        {"R1": 4, "R2": 0x0001},
+        {"R2": 0x0010},
+    ))
+
+    # SHAB R1, R2 -- same signed-count encoding as SHL, but right shifts
+    # are ARITHMETIC (sign-preserving), contrasted directly against SHL's
+    # logical 0x40 result for the identical input above.
+    results.append(run(
+        "SHA with a negative count shifts right arithmetically",
+        bytes([0xb9, 0x41, 0x62]),
+        {"R1": 0xffffffff, "R2": 0x81},  # count = -1
+        {"R2": 0xc0},
+    ))
+
+    # Right shift beyond the operand's width fully sign-extends (confirmed
+    # reference behavior for this specific case, unlike SHL's analogous
+    # branch which the reference itself leaves undefined).
+    results.append(run(
+        "SHA right shift beyond the operand's width fully sign-extends",
+        bytes([0xb9, 0x41, 0x62]),
+        {"R1": 0xfffffff8, "R2": 0x80},  # count = -8
+        {"R2": 0xff},
+    ))
+
+    # The harness only dumps registers/PC, not flags directly -- so to
+    # check the overflow flag itself (not just the shifted value), follow
+    # SHA with BV8 (branch-if-overflow) into one of two marker blocks that
+    # each set R4 to a distinct sentinel and spin forever, the same
+    # technique already validated for CMPB+BE8 above.
+    #
+    #   addr0:  SHAB R1, R2                  (3 bytes)
+    #   addr3:  BV8 +7  -> addr10 if overflow (2 bytes)
+    #   addr5:  MOVB R5, R4   ; no-overflow marker (0xAA)
+    #   addr8:  BR8 +0        ; spin
+    #   addr10: MOVB R6, R4   ; overflow marker (0xBB)
+    #   addr13: BR8 +0        ; spin
+    sha_overflow_prog = bytes([
+        0xb9, 0x41, 0x62,
+        0x60, 0x07,
+        0x09, 0x45, 0x64,
+        0x6a, 0x00,
+        0x09, 0x46, 0x64,
+        0x6a, 0x00,
+    ])
+
+    # Left shift by 2+ CAN set overflow (unlike SHL, which never does):
+    # 0x40 (positive) shifting to a sign-changed value.
+    results.append(run(
+        "SHA left shift by 2 sets overflow when the sign effectively changes",
+        sha_overflow_prog,
+        {"R1": 2, "R2": 0x40, "R4": 0, "R5": 0xaa, "R6": 0xbb},
+        {"R4": 0xbb},
+    ))
+
+    # A real, non-obvious quirk this project's own derivation predicted and
+    # wants confirmed against the actual reference, not just self-consistent
+    # unit tests: a single-bit left shift's overflow formula degenerates to
+    # comparing the sign bit against itself, so it NEVER reports overflow --
+    # even here, where 0x40 (positive) becomes 0x80 (negative).
+    results.append(run(
+        "SHA left shift by exactly 1 never reports overflow even when the sign visibly changes",
+        sha_overflow_prog,
+        {"R1": 1, "R2": 0x40, "R4": 0, "R5": 0xaa, "R6": 0xbb},
+        {"R4": 0xaa},
+    ))
+
+    # CALL [R3], #7 then RET back -- CALL's operands can never legitimately
+    # be a bare register (rejected the same way JMP/JSR reject one), so
+    # both must be general form (instflags bit 7 set) here; R3 (jump
+    # target) points at a RET landing pad further along in the same blob,
+    # and the return address (right after CALL) holds a marker MOVB
+    # followed by a self-loop, so PC settles somewhere checkable instead of
+    # drifting.
+    #
+    #   addr0: CALL [R3], #7           (4 bytes: 0x49, 0x80, 0x63, 0xE7)
+    #   addr4: MOVB R9, R10            ; marker: returned here (3 bytes)
+    #   addr7: BR8 +0                  ; spin
+    #   addr9: RET_0 #0                ; landing pad for CALL (2 bytes)
+    call_prog = bytes([
+        0x49, 0x80, 0x63, 0xe7,
+        0x09, 0x49, 0x6a,
+        0x6a, 0x00,
+        0xe2, 0xe0,
+    ])
+    results.append(run(
+        "CALL sets a new AP and jumps; RET restores the old AP and returns",
+        call_prog,
+        {"R3": RESET_VECTOR + 9, "R9": 0x77, "R10": 0, "AP": 0x9999, "SP": 0x8000},
+        # PC settles 3 bytes past the return address, at the self-loop. The
+        # return address itself is computed from CALL's *raw* (unmasked,
+        # 0xFFFFFFF0-based) PC -- not the masked reset vector R3 uses --
+        # same distinction documented for JSR/JMP earlier in this file.
+        {"PC": 0xfffffff0 + 4 + 3, "R10": 0x77, "AP": 0x9999, "SP": 0x8000},
+    ))
+
+    # JMP #0 -- JMP hardcodes a Byte-sized operand decode regardless of
+    # addressing mode (confirmed against the reference's opJMP, which
+    # always passes moddim=0), so even a "full" immediate here reads only
+    # one byte. Address 0 is v60test.cpp's pre-filled landing pad (an
+    # infinite self-branch), so PC settles there instead of drifting
+    # through uninitialized memory.
+    results.append(run(
+        "JMP through an immediate treats it as a literal absolute address",
+        bytes([0xd6, 0xf4, 0x00]),
+        {},
+        {"PC": 0x00},
+    ))
+
     print()
     print(f"{sum(results)}/{len(results)} programs matched the MAME v60_device reference exactly.")
     return 0 if all(results) else 1

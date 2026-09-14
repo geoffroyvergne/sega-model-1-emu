@@ -56,13 +56,18 @@ Overflow/Sign/Zero — confirmed that's the *complete* flag set the reference
 implementation tracks, no parity despite naming, see
 `docs/hardware-notes/07-v60-architecture.md`), a `Bus` interface, and a
 correct, unit-tested instruction/addressing-mode slice: HALT, NOP,
-MOV(B/H/W), CMP(B/H/W), ADD(B/H/W), SUB(B/H/W), all 15 conditional branches
+MOV(B/H/W), CMP(B/H/W), ADD(B/H/W), SUB(B/H/W), AND/OR/XOR/NOT(B/H/W),
+INC/DEC(B/H/W), SHL(B/H/W), SHA(B/H/W), all 15 conditional branches
 (BV/BNV/BL/BNL/BE/BNE/BNH/BH/BN/BP/BR/BLT/BGE/BLE/BGT, each in 8-bit and
-16-bit displacement form), and JMP/JSR/RSR/RET — over register-direct,
-register-indirect, autoincrement, autodecrement, and 8-bit-displacement
-addressing. **The CPU can now execute a loop, an if-statement, and a
-function call**, not just straight-line code. 45 unit tests pass (doctest,
-vendored in `third_party/`).
+16-bit displacement form), JMP/JSR/RSR/RET, CALL, and PUSH/POP — over
+register-direct, register-indirect, autoincrement, autodecrement,
+8-bit-displacement, and **immediate** (both "quick" 0-15 literals and
+full-width literals) addressing. **Both of the V60's call/return
+conventions are now implemented, and the CPU can load a constant, do
+bitwise logic and both logical and arithmetic bit shifts, execute a loop,
+an if-statement, and save/restore registers across a call** — not just
+straight-line arithmetic on values already in registers. 80 unit tests
+pass (doctest, vendored in `third_party/`).
 
 Adding ADD/SUB needed zero new addressing-mode code — they're
 read-modify-write on operand 2, and the `Operand` abstraction built for
@@ -81,14 +86,43 @@ All confirmed in `docs/hardware-notes/07-v60-architecture.md`.
 tests against that reading** — `tools/oracle-harness/` now runs real V60
 machine-code snippets through an actual MAME `v60_device` (no game ROM
 needed: just a minimal standalone driver) and checks the results against
-the same expectations as our unit tests. Current result: **8/8 test
+the same expectations as our unit tests. Current result: **27/27 test
 programs match the reference core exactly**, across MOV, CMP, ADD/SUB
-(including wraparound), both branch outcomes, and JSR. Building this also
-surfaced two more real, confirmed hardware facts (this configuration's
+(including wraparound), AND/OR/XOR/NOT, INC/DEC, SHL, SHA, both branch
+outcomes, JSR, CALL/RET, PUSH/POP, and both immediate addressing modes.
+Building this
+also surfaced two more real, confirmed hardware facts (this configuration's
 24-bit address masking, and that the PC register displays a raw/unmasked
-value even though bus accesses are masked) — see the hardware note. This
-was worth doing now, while the core is still small: the two addressing-mode
-bugs already found this phase were both "internally consistent with our
+value even though bus accesses are masked) — see the hardware note.
+Immediate addressing separately surfaced a real per-instruction limitation
+caught by our *own* test suite: JMP/JSR hardcode a byte-sized operand
+decode regardless of addressing mode, so a literal jump target through
+this path can only be 0-255 — confirmed correct (not a bug) by checking
+against the reference's `opJMP`/`opJSR`; PUSH/POP hardcode a Long-sized
+decode the same way, and **SHL's shift-count operand hardcodes Byte size
+even in the 16/32-bit forms** — a bug in an early draft, caught by
+re-reading the reference's exact `F12DecodeOperands` call *before* writing
+tests, not after a failure. AND/OR/XOR/NOT surfaced a flag-handling gotcha
+instead: unlike ADD/SUB/CMP, they leave the carry flag completely untouched
+rather than setting it — and INC/DEC swing back the other way, using the
+exact same full-carry ADD/SUB flag macros despite being single-operand. A
+test written for INC/DEC's register-indirect case initially repeated the
+modm/index mistake from earlier in this phase (in the test this time, not
+the implementation) — caught immediately by its own assertion. **SHA
+produced this phase's most genuinely surprising finding**: its left-shift
+overflow flag is mathematically incapable of firing for a 1-bit shift
+(the detection formula degenerates to comparing the sign bit against
+itself), so a textbook sign-changing 1-bit shift reports no overflow at
+all — derived by hand from the flag formula, then confirmed against the
+real oracle before being trusted, not just asserted from our own reading.
+CALL revealed a real design consequence rather than just a decode-shape
+mismatch: since its operands (like JMP/JSR's) can never legitimately be a
+bare register, the "one general, one short" decode shape everything else
+uses so far would make CALL permanently unusable — some real encoding
+needed the "both operands general" case (instflags bit 7), so that was
+added too, scoped only to CALL's dedicated raw-operand decoder rather than
+generally. This was worth doing now, while the core is still small: the addressing-mode
+bugs already found this phase were "internally consistent with our
 own tests, but wrong" — exactly the failure mode oracle comparison is
 positioned to catch that more unit tests against our own understanding
 cannot.

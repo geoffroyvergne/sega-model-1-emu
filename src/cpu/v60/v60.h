@@ -122,30 +122,55 @@ private:
     void write_sized(uint32_t& dest, Dim dim, uint32_t value) const;
     static uint32_t dim_bytes(Dim dim);
 
-    // A decoded operand: either a register (read/written directly) or a
-    // resolved memory address (read/written through the bus). Any
+    // A decoded operand: a register (read/written directly), a resolved
+    // memory address (read/written through the bus), or an immediate
+    // (read-only -- constructed by decode_general_operand for the literal
+    // addressing modes; writing to one throws UnimplementedAddressingMode,
+    // matching that there is no real hardware meaning for it). Any
     // side-effecting addressing mode (autoincrement/autodecrement) has
     // already been applied to the register file by the time this is
     // returned -- see decode_general_operand.
     struct Operand {
-        bool is_register;
-        uint8_t reg;
-        uint32_t address;
+        enum class Kind { Register, Memory, Immediate };
+        Kind kind;
+        uint8_t reg;      // valid when kind == Register
+        uint32_t address; // valid when kind == Memory
+        uint32_t value;   // valid when kind == Immediate
     };
     uint32_t read_operand(const Operand& op, Dim dim);
     void write_operand(const Operand& op, Dim dim, uint32_t value);
+
+    // Resolves an operand that must denote an address (used by JMP/JSR):
+    // a Memory operand's address, or an Immediate operand's value used
+    // directly as an absolute address (confirmed valid against the
+    // reference core's am2Immediate/am2ImmediateQuick -- "jump to this
+    // literal address" is a real, meaningful encoding). A Register operand
+    // is invalid here and throws (a register holds a value, not something
+    // you can jump "to").
+    uint32_t operand_as_address(const Operand& op, uint32_t opcode_pc, uint8_t modifier_byte);
 
     // Resolves a "general form" operand's modifier byte at `modifier_addr`.
     // `modm` must be (instflags & 0x40) != 0 -- it selects which of the two
     // addressing-mode tables the modifier byte's top 3 bits index into
     // (see the file-level comment above). `out_length` receives the number
-    // of bytes the modifier consumed (1, or 2 when a displacement byte
-    // follows it) so the caller can advance PC correctly.
+    // of bytes the modifier consumed (1, or more for a displacement/
+    // immediate that follows it) so the caller can advance PC correctly.
     //
     // Supported so far (modm, top-3-bits) -> mode:
-    //   (0, 0) displacement-8   (1, 3) register-direct
-    //   (0, 3) register-indirect  (1, 4) autoincrement
-    //                              (1, 5) autodecrement
+    //   (0, 0) displacement-8       (1, 3) register-direct
+    //   (0, 3) register-indirect    (1, 4) autoincrement
+    //   (0, 7) "Group 7" -- only    (1, 5) autodecrement
+    //          its immediate sub-modes are implemented (see below)
+    //
+    // Group 7 (modm=0, top-3-bits=7) is itself sub-decoded by the
+    // modifier byte's low 5 bits (confirmed against am1.hxx's 32-entry
+    // s_AMTable1_G7): values 0-15 are "immediate quick" (the 4-bit value
+    // 0-15 is the low nibble of those same bits -- no extra bytes), value
+    // 20 is a full-width immediate (1/2/4 extra bytes per `dim`). The
+    // remaining Group 7 sub-modes (PC-relative addressing, absolute
+    // direct address, and their *-deferred/double-displacement variants)
+    // are not yet implemented.
+    //
     // Anything else throws UnimplementedAddressingMode.
     Operand decode_general_operand(uint32_t modifier_addr, Dim dim, bool modm, uint8_t& out_length);
 
@@ -169,9 +194,38 @@ private:
     };
     Format12 decode_format12(Dim dim1, Dim dim2);
 
+    // Same instflags encoding as decode_format12, but resolves BOTH
+    // operands to raw `Operand`s without reading either as a value --
+    // needed for CALL, whose two operands (confirmed against the
+    // reference's opCALL) are both decoded via ReadAMAddress: one is a
+    // jump target, the other a raw value assigned into AP, neither is a
+    // "value at dim width" the way every other Format-1/2 instruction's
+    // operand 1 is. decode_format12 can't be reused as-is because it
+    // always eagerly reads operand 1.
+    //
+    // Also implements the "both operands general" case (instflags bit 7)
+    // that decode_format12 still doesn't -- CALL's operands can never
+    // legitimately be a bare register (see operand_as_address), so a CALL
+    // with one short-form operand would be permanently unusable; real
+    // encodings need both general. See the .cpp for the exact bit-7 layout
+    // (op2's modm comes from a different bit than in the non-bit-7 case).
+    struct Format12RawOperands {
+        Operand op1;
+        Operand op2;
+        uint8_t length;
+    };
+    Format12RawOperands decode_format12_raw(Dim dim1, Dim dim2);
+
     void set_add_flags(Dim dim, uint64_t result, uint32_t src, uint32_t dst);
     void set_sub_flags(Dim dim, uint64_t result, uint32_t src, uint32_t dst);
     void set_szf(Dim dim, uint64_t result);
+
+    // AND/OR/XOR/NOT flags, confirmed against the reference core's
+    // ANDB/ORB/XORB/NOTB macros: overflow is always cleared, sign/zero set
+    // from the result as usual -- but unlike add/sub, carry is left
+    // completely untouched (not even cleared). Easy to miss since every
+    // other flag-setting instruction implemented so far touches carry.
+    void set_logical_flags(Dim dim, uint32_t result);
 
     // Conditional branches (opcodes 0x60-0x7F) encode cleanly: the low 4
     // bits of the opcode select one of the conditions below, bit 4 selects
@@ -194,6 +248,23 @@ private:
     int op_cmp(Dim dim);
     int op_add(Dim dim);
     int op_sub(Dim dim);
+    int op_and(Dim dim);
+    int op_or(Dim dim);
+    int op_xor(Dim dim);
+    int op_not(Dim dim);
+
+    // SHL: operand 1 is a SIGNED shift count (positive = left, negative =
+    // right, zero = no-op but flags still recomputed) applied to operand
+    // 2, both directions LOGICAL (zero-fill) -- confirmed against the
+    // reference core's opSHLB/opSHLH/opSHLW ("TRUSTED").
+    int op_shl(Dim dim);
+
+    // SHA: same signed-count encoding as SHL, but the right shift is
+    // ARITHMETIC (sign-preserving) instead of logical, and the left shift
+    // computes a genuine overflow flag (did the sign change during the
+    // shift?) instead of always clearing it like SHL does. Confirmed
+    // against the reference core's opSHAB/opSHAH/opSHAW.
+    int op_sha(Dim dim);
 
     // JMP/JSR/RET decode a single operand directly at PC+1 -- there is no
     // instflags byte for these (unlike Format-1/2 instructions); `modm` is
@@ -206,6 +277,33 @@ private:
     int op_jsr(bool modm);
     int op_rsr();
     int op_ret(bool modm);
+
+    // CALL: the VAX-style call convention that links AP into a stack
+    // frame (pairs with RET, not RSR -- see the RET comment above and
+    // docs/hardware-notes/07-v60-architecture.md). Both operands are
+    // addresses (op1: jump target, op2: new AP value), decoded via
+    // decode_format12_raw rather than decode_format12 since neither is a
+    // "value at dim width" operand. Confirmed against the reference's
+    // opCALL ("TRUSTED"): pushes the old AP, sets AP = op2, pushes the
+    // return address, jumps to op1.
+    int op_call();
+
+    // PUSH/POP: single Long-sized general operand at PC+1, same
+    // no-instflags shape as JMP/JSR/RET. PUSH reads the operand as a value
+    // and pushes it; POP pops a value and writes it to the operand (so,
+    // unlike JMP/JSR, POP's operand IS a valid write target -- a register
+    // or memory location, decoded the normal way). Neither touches flags.
+    int op_push(bool modm);
+    int op_pop(bool modm);
+
+    // INC/DEC: single general operand at PC+1 (dim-sized, no instflags
+    // byte), read-modify-write by exactly 1 -- using the *same* full
+    // ADD/SUB-style flags (including carry) as ADD/SUB themselves, unlike
+    // AND/OR/XOR/NOT's carry-untouched behavior. Confirmed against the
+    // reference's opINCB/opDECB, which literally call the same ADDB/SUBB
+    // macro as opADDB/opSUBB with a constant operand of 1.
+    int op_inc(Dim dim, bool modm);
+    int op_dec(Dim dim, bool modm);
 };
 
 } // namespace model1::cpu::v60

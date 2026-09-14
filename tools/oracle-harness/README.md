@@ -76,3 +76,9 @@ to `0x00FFFFF0` — test programs are loaded there, not at address 0. See
 `docs/hardware-notes/07-v60-architecture.md` for the full story (including
 why the *PC register itself* still displays the raw, unmasked value after
 execution, even though bus accesses are masked).
+
+For the same reason, `v60test.cpp` pre-fills address `0` with its own
+infinite self-branch before loading your test program — a landing pad for
+anything that jumps/calls to a low absolute address (e.g. testing an
+immediate-addressed `JMP`), so it settles on a checkable state instead of
+drifting through uninitialized (HALT-decoding-but-not-halting) memory too.

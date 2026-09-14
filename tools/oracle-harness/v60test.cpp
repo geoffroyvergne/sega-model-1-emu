@@ -107,10 +107,20 @@ void v60test_state::machine_start()
 	std::vector<uint8_t> program(program_length);
 	in.read(reinterpret_cast<char *>(program.data()), program_length);
 
+	address_space &space = m_maincpu->space(AS_PROGRAM);
+
+	// A stable landing pad at address 0: an infinite self-branch (BR8 +0).
+	// Lets test programs that jump/call to a low absolute address (e.g. via
+	// an immediate operand) settle into something checkable instead of
+	// drifting through uninitialized (HALT-decoding, but not
+	// halting -- see the gotcha in README.md) scratch memory for the rest
+	// of the run.
+	space.write_byte(0, 0x6a);
+	space.write_byte(1, 0x00);
+
 	// Loaded at the real (24-bit-masked) reset vector, not address 0 --
 	// see the file header comment for why.
 	constexpr uint32_t kResetVector = 0x00fffff0;
-	address_space &space = m_maincpu->space(AS_PROGRAM);
 	for (uint32_t i = 0; i < program_length; i++)
 		space.write_byte(kResetVector + i, program[i]);
 

@@ -217,7 +217,7 @@ branch target in every game — worth a dedicated test
 (`BR8 branches relative to its own opcode address, not the next
 instruction`, in `v60_test.cpp`) rather than trusting it by inspection.
 
-## Two parallel call/return conventions -- confirmed both exist, only implemented the simpler one fully
+## Two parallel call/return conventions -- both now implemented
 
 The V60 has **two unrelated call/return mechanisms**, confirmed by reading
 both directly rather than assuming there's only one:
@@ -240,18 +240,45 @@ both directly rather than assuming there's only one:
 address decode as JSR, no push, just jumps. All three (JMP/JSR/RSR) are
 marked `/* TRUSTED */` in the reference source.
 
-Implemented so far: **JMP, JSR, RSR, and RET** (RET was easy to add once
-JSR's operand-decode was in place — it just decodes a `Long`-sized general
-operand as a *value* via the already-existing `decode_general_operand` +
-`read_operand` pair, at PC+1, no instflags byte, matching the pattern
-already confirmed for JMP/JSR). **CALL itself is deliberately not yet
-implemented** — it needs an instflags-based two-operand decode where
-*neither* operand is read as a value (op1 is a jump address, op2 is a raw
-address value assigned into AP), which doesn't fit `decode_format12`'s
-current assumption that operand 1 is always read. Revisit CALL specifically
-if real ROM code turns out to use it — JSR/RSR may be the more common
-convention a C-like compiler targeting this chip would actually emit, but
-that's an assumption, not yet confirmed against real disassembly.
+**All four of JMP, JSR, RSR, and RET were implemented first** (RET was easy
+to add once JSR's operand-decode was in place — it just decodes a
+`Long`-sized general operand as a *value* via the already-existing
+`decode_general_operand` + `read_operand` pair, at PC+1, no instflags byte,
+matching the pattern already confirmed for JMP/JSR).
+
+**CALL itself needed a second, dedicated decode path** — confirmed against
+the reference's `opCALL` (`F12DecodeOperands(&ReadAMAddress, 0,
+&ReadAMAddress, 2)`): both operands are addresses, and *neither* is read as
+a value, which doesn't fit `decode_format12`'s "operand 1 is always read"
+assumption. Added `decode_format12_raw`, returning both operands as raw
+`Operand`s.
+
+That surfaced a real design consequence, not just a decode-shape mismatch:
+**CALL's operands can never legitimately be a bare register** (there's no
+meaning for "jump to this register's index number" or "set AP to this
+register's index number", exactly like JMP/JSR's rejection of a register
+target) — but the "one general, one short" encoding `decode_format12_raw`
+started with *always* produces a bare register for whichever operand is
+short-form. That combination would make CALL **permanently unusable**: no
+real encoding could ever avoid hitting the rejected case on one side or the
+other. So `decode_format12_raw` also had to implement the "both operands
+general" case (instflags bit 7) — confirmed against the reference's
+`F12DecodeOperands` bit-7 branch: op2's modifier byte sits immediately
+after op1's encoded length, and op2's modm comes from instflags bit 5 in
+this branch specifically, not bit 6 (which is op1's modm here — a
+different bit gets reused for a different purpose depending on which
+branch of the same byte you're in). `decode_format12` itself (used by every
+value-reading instruction so far) still doesn't support bit 7 — this was
+added only where CALL's own correctness required it, not generally.
+
+Validated against the real oracle: CALL setting a new AP and jumping, and
+RET restoring the old AP, both confirmed exactly (27/27 current oracle
+total) — including catching a test-expectation bug of our own along the
+way (the return address is computed from CALL's *raw*, unmasked PC, same
+distinction documented for JSR/JMP above; an early version of the oracle
+test used the masked reset vector instead and mismatched by exactly the
+mask difference — the implementation was right, the test's arithmetic
+wasn't).
 
 A real hardware invariant carried over faithfully: JMP/JSR's target
 **cannot be a bare register** (the reference asserts this) — a register
@@ -307,27 +334,229 @@ results before the methodology was fixed:
   (an infinite self-branch) and check behavior via register side effects
   instead.
 
+## Immediate/literal addressing: "Group 7," and a real per-instruction gotcha
+
+Registers and memory aren't enough — real code needs to load constants.
+Confirmed against `am1.hxx`'s 32-entry `s_AMTable1_G7` sub-table (reached
+when a general operand's modm=0 and top-3-bits=7, i.e. modifier byte
+`0xE0`-`0xFF`, sub-decoded by the *same byte's* low 5 bits):
+
+- **Sub-indices 0-15** (modifier `0xE0`-`0xEF`) are **"immediate quick"** —
+  the constant *is* those same low 4 bits, 0-15, with **no extra bytes at
+  all**. The single most space-efficient way to encode the small integer
+  literals (loop bounds, flags, small offsets) that dominate real code.
+- **Sub-index 20** (modifier `0xF4`) is a **full-width immediate** — a
+  literal of whatever size `dim` says (1/2/4 bytes) follows the modifier
+  byte directly.
+- The remaining sub-indices (16-19, 21-31) are PC-relative addressing, an
+  absolute "direct address" mode, and their indirect/double-displacement
+  variants — not yet implemented (see the deferred list below).
+- Confirmed **immediate operands are read-only** by construction (there is
+  no real hardware meaning for "write to a literal") — our `Operand` type
+  now has a third kind (`Immediate`, alongside `Register`/`Memory`), and
+  `write_operand` throws if one is ever used as a destination.
+- **Confirmed valid, and genuinely useful**: `am2Immediate`/
+  `am2ImmediateQuick` (the `ReadAMAddress` variants, used by JMP/JSR/CALL)
+  delegate straight to the same value-producing functions — meaning "jump
+  to this literal address" is a real, meaningful encoding, not an error.
+  Only a bare register target is actually invalid for JMP/JSR.
+- **Real per-instruction gotcha, caught by our own test suite** (not by
+  the oracle this time — by just trying it): **JMP/JSR hardcode a
+  Byte-sized (`dim=0`) operand decode**, confirmed against the reference's
+  `opJMP`/`opJSR` (`m_moddim = 0;`, unconditionally, regardless of what
+  addressing mode is actually used). This means a "full immediate" jump
+  target through this path can only ever be **0-255** — real code wanting
+  to encode an arbitrary 32-bit absolute jump target would need Group 7's
+  separate "direct address" sub-mode (index 19, not yet implemented), not
+  the general immediate. An earlier version of our test suite assumed a
+  4-byte address here and failed against our *own* core — correctly, since
+  our core faithfully reproduces this real hardware limitation. The fix
+  was to correct the test's expectation, not the code.
+
+Validated against the real oracle too (`tools/oracle-harness/`): both
+immediate-quick and full-immediate MOV, and JMP through an immediate, all
+match the reference core exactly (11/11 current total).
+
+## AND/OR/XOR/NOT: same shapes as before, one new flag-handling gotcha
+
+Confirmed against `op12.hxx`'s `opANDB`/`opORB`/`opXORB`/`opNOTB` (all
+marked "TRUSTED"):
+
+- **AND/OR/XOR** (`0xA0`/`0x88`/`0xB0` for the byte forms, `+2`/`+4` for
+  H/W) are read-modify-write on operand 2 — the exact same shape as ADD/SUB,
+  so `op_and`/`op_or`/`op_xor` needed zero new decode work, just the
+  bitwise operator swapped in.
+- **NOT** (`0x38`/`0x3A`/`0x3C`) is, despite sounding unary, a genuine
+  two-operand instruction: operand 1 is read, its complement is computed,
+  and the result is written to operand 2 — the same shape as MOV.
+- **Flag gotcha, confirmed by reading the macros directly rather than
+  assuming**: all four **clear overflow** and **set sign/zero from the
+  result**, exactly like ADD/SUB/CMP — but **carry is left completely
+  untouched**, not even cleared. Every flag-setting instruction implemented
+  before this one (ADD, SUB, CMP) *does* set carry, making "leave it alone"
+  the one that's easy to get wrong by pattern-matching against those. Test
+  coverage specifically establishes a known carry state via a prior CMP,
+  then confirms AND leaves it exactly as it found it (`tests/unit/v60_test.cpp`
+  and `tools/oracle-harness/compare_v60.py`, both passing against the real
+  reference core — 15/15 current oracle total).
+
+## PUSH/POP: another "no new decode work" instruction, plus one ordering subtlety
+
+Confirmed against `op3.hxx`'s `opPUSH`/`opPOP`. Both decode a single
+operand directly at PC+1 — same no-instflags shape as JMP/JSR/RET — so
+`op_push`/`op_pop` needed no new addressing-mode code, just wiring up
+`decode_general_operand` + `read_operand`/`write_operand` again:
+
+- **PUSH** (`0xEE`/`0xEF`) reads the operand as a value and pushes it
+  (`SP -= 4; write32(SP, value)`).
+- **POP** (`0xE6`/`0xE7`) pops a value (`value = read32(SP); SP += 4`) and
+  writes it to the operand — unlike JMP/JSR, POP's operand *is* a valid
+  write target (register or memory), decoded the normal way.
+- **Both hardcode a Long-sized (`dim=2`) operand decode**, confirmed via
+  `m_moddim = 2` in the reference — same pattern already seen for JMP/JSR's
+  hardcoded Byte size, just a different fixed width. A `PUSH` of an
+  immediate-quick literal (nominally a 4-bit value) still pushes the full
+  32-bit value, not something byte-truncated; tested explicitly.
+- **Neither touches flags** — confirmed by their absence from `_S`/`_Z`/
+  `_OV`/`_CY` in both functions.
+- **Ordering subtlety, applied even though it's usually invisible**: POP's
+  reference implementation pops the stack value *before* decoding the
+  destination operand's address. This only matters if the destination
+  operand is itself SP-relative (e.g. an indirect/displacement mode using
+  SP as the base register) — a genuinely obscure case — but matching the
+  real order costs nothing, so `op_pop` does the same rather than
+  reordering for convenience and hoping it never matters.
+
+Validated against the real oracle: PUSH+POP round-tripping a value through
+the stack, and PUSH of an immediate, both match exactly (17/17 current
+oracle total).
+
+## INC/DEC: single-operand, but full ADD/SUB-style flags (unlike AND/OR/XOR/NOT)
+
+Confirmed against `op3.hxx`'s `opINCB`/`opDECB` (`0xD8`-`0xDD` for INC,
+`0xD0`-`0xD5` for DEC, B/H/W × modm-0/1 pairs): a single general operand,
+decoded the same no-instflags way as JMP/JSR/PUSH/POP, read-modify-write by
+exactly 1. The flags are the interesting part: **INC/DEC compute their
+result via the literal same `ADDB`/`SUBB` macros `opADDB`/`opSUBB` use**
+(with the other operand hardcoded to 1) — meaning they set the *full*
+arithmetic flag set, **including carry**, unlike AND/OR/XOR/NOT (which
+leave carry untouched, see above). Two adjacent instructions in this ISA
+handle carry in opposite ways depending on whether they're arithmetic or
+logical in nature — worth remembering as more instructions get added.
+
+Also worth noting: a test written for this feature initially used the
+*wrong* opcode variant for a register-indirect case (`INCB_1`/modm=1 with a
+mode-index-3 modifier, which under modm=1 is register-*direct*, not
+indirect — the same modm/index distinction documented earlier in this
+file). The test's own assertion caught it immediately (the "address"
+register itself changed value, which register-indirect should never do).
+Fixed by using `INCB_0`/modm=0 instead. Not a new class of bug — the exact
+same modm confusion as before, just in a test this time instead of the
+implementation, which is exactly why keeping that gotcha table above handy
+matters as coverage grows.
+
+Validated against the real oracle: INCB's carry-on-overflow, and DECB
+through register-indirect (confirmed the address register itself is left
+untouched), both match exactly (19/19 current oracle total).
+
+## SHL: a signed shift count, and a real "caught before shipping" bug
+
+Confirmed against `op12.hxx`'s `opSHLB`/`opSHLH`/`opSHLW` (`0xA9`/`0xAB`/
+`0xAD`, all "TRUSTED"). The V60's shift instructions use a compact
+VAX-style encoding: operand 1 is a **signed** count — positive shifts
+left, negative shifts right, zero recomputes flags without changing the
+value — and **both directions of SHL are logical** (zero-fill; there's a
+separate instruction, SHA, for arithmetic/sign-preserving right shift,
+still not implemented — see the deferred list). Carry gets the last bit
+shifted out; overflow is always cleared regardless of direction.
+
+**Real gotcha, caught by re-reading the reference before writing tests
+rather than after shipping a bug**: the count operand (op1) is decoded as
+**Byte-sized unconditionally**, even in `opSHLH`/`opSHLW` — confirmed by
+the literal `F12DecodeOperands(&ReadAM, 0, &ReadAMAddress, dim)` call,
+where that first `0` is not a typo mirroring `dim`, it's really hardcoded.
+This is specific to the shift instructions; ADD/SUB/AND/OR/XOR use matching
+dims for both operands (separately confirmed). A first draft of
+`op_shl` passed the instruction's own `dim` for both operands — wrong for
+SHLH/SHLW's count decode — caught by grepping for the exact
+`F12DecodeOperands` call before writing any test, not by a failing test
+after the fact. Worth internalizing as a pattern: **when adding any new
+instruction, check whether the reference hardcodes a dim for one operand
+independent of the instruction's suffix**, rather than assuming operands
+always share the instruction's declared width.
+
+Also handled explicitly, since even the reference's own comment flags it
+as uncertain: shifting by a count `>=` the operand's bit width. We define
+this as an all-bits-shifted-out zero result with no carry — the most
+natural reading — but this is our own choice, not confirmed against real
+silicon, exactly because the reference itself doesn't commit to one either.
+
+Validated against the real oracle: positive-count left shift with carry,
+negative-count logical (not arithmetic) right shift, and the byte-sized
+count applying even to the 16-bit form, all match exactly (22/22 current
+oracle total).
+
+## SHA: a genuinely surprising quirk, derived from the formula and then confirmed against real execution
+
+Confirmed against `op12.hxx`'s `opSHAB`/`opSHAH`/`opSHAW` (`0xB9`/`0xBB`/
+`0xBD`) and the `SHIFTLEFT_OV`/`SHIFTLEFT_CY`/`SHIFTARITHMETICRIGHT_OV`/
+`SHIFTARITHMETICRIGHT_CY` macros. SHA shares SHL's signed-count encoding
+(and the same Byte-sized-count-regardless-of-dim gotcha) but differs in
+two ways:
+
+- **Right shift (negative count) is arithmetic**, not logical — the sign
+  bit is replicated, not zero-filled. `0x81` (`-127` as a signed byte)
+  shifted right by 1 gives `0xC0` here, vs. SHL's `0x40` for the identical
+  input.
+- **Left shift (positive count) computes a genuine overflow flag** instead
+  of always clearing it — did any bit shifted past the sign position
+  disagree with what the final sign implies (the `SHIFTLEFT_OV` formula:
+  mask the top `count` bits, compare against all-sign).
+
+**A real, non-obvious quirk, worth the full story of how it was found**:
+working through `SHIFTLEFT_OV`'s mask arithmetic by hand for a **1-bit**
+left shift shows the mask covers *only* the single bit already used to
+decide which branch of the formula runs (the original sign bit itself) —
+so the comparison is tautological and **overflow can never be true for a
+1-bit left shift**, regardless of whether the shifted value's sign
+actually changes. `0x40` (positive) shifting to `0x80` (negative) — a case
+that obviously *should* overflow by any intuitive definition — reports no
+overflow at all. This was derived by hand from the macro before writing
+any test (not observed by trial and error), then a test was written
+specifically to check whether that derivation was right, and it was:
+**confirmed against the real MAME reference core**, not just internally
+consistent with our own reading. Shift counts of 2 or more use a wider
+mask and detect overflow correctly. If a real game's code ever relies on
+SHA's overflow flag after a 1-bit shift expecting it to reflect a sign
+change, this quirk — not a bug in our emulation — is why it won't.
+
+Also confirmed (matching, not contrasting with, SHL): right-shifting by
+the operand's full width or more is a case the reference commits to a
+real answer for (unlike SHL's analogous case, which it leaves undefined)
+— the result becomes fully sign-extended (`0xFF` or `0x00`), not zero.
+
+Validated against the real oracle, including the overflow quirk itself
+(observed indirectly via a `BV8` branch into one of two marker blocks,
+the same technique proven for CMPB+BE8): 26/26 current oracle total.
+
 ## Scope deliberately deferred (not yet implemented)
 
 - Displacement-16/32, displacement-indirect (8/16/32), double-displacement,
-  "Group 6"/"Group 7" sub-decoded modes, bit-string/bit-field modes,
-  immediate literals — each throws `UnimplementedAddressingMode` for now.
-- The "both operands general" case (instflags bit 7 set) — throws
-  `UnimplementedAddressingMode` until the general addressing-mode table
-  exists for both operands simultaneously (op2's modifier byte position
-  depends on op1's encoded length).
-- **CALL** (`0x49`) — see the call/return section above for why; JMP, JSR,
-  RSR, and RET are implemented, CALL specifically is not.
+  "Group 6" (register-relative extended encoding), PC-relative addressing,
+  absolute "direct address," and bit-string/bit-field modes — each throws
+  `UnimplementedAddressingMode` for now. (Immediate literals — Group 7's
+  quick and full-width sub-modes — *are* implemented; see above.)
+- The "both operands general" case (instflags bit 7 set) for
+  `decode_format12` (value-reading instructions: MOV/CMP/ADD/SUB/AND/OR/
+  XOR/NOT/SHL/SHA) — still throws `UnimplementedAddressingMode` there.
+  `decode_format12_raw` (used only by CALL so far) *does* support it — see
+  the call/return section above.
 - Everything else in the ~200-opcode instruction set beyond
-  HALT/NOP/MOV/CMP/ADD/SUB/the 15 conditional branches/JMP/JSR/RSR/RET —
-  multiply/divide, logical ops, shifts, string/bit-field instructions,
-  the stack-frame-setup instructions (PUSH/POP/PUSHM/PREPARE), interrupts
-  and system/privileged instructions.
-- ADD/SUB and most of the rest of the ISA — deferred because they use a
-  read-modify-write addressing path (`ReadAMAddress` / `F12LOADOP2*` /
-  `F12STOREOP2*` in the reference) that's more involved than MOV/CMP's
-  plain read-or-write; not yet traced in enough depth to implement
-  correctly. Next concrete step for Phase 1.
+  HALT/NOP/MOV/CMP/ADD/SUB/AND/OR/XOR/NOT/PUSH/POP/INC/DEC/SHL/SHA/CALL/
+  the 15 conditional branches/JMP/JSR/RSR/RET — multiply/divide, rotates,
+  string/bit-field instructions, PUSHM/POPM (push/pop multiple registers
+  via a bitmask) and PREPARE (stack-frame setup for CALL's convention),
+  interrupts and system/privileged instructions.
 - Interrupts, exceptions, privilege levels, the system/control register
   bank, memory protection/paging — all likely irrelevant to a game ROM
   running in whatever mode the boot code sets up, but not yet confirmed;
