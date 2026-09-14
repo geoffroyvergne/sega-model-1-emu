@@ -13,22 +13,49 @@ for scope.
 
 ## Status
 
-Phase 0 (research & tooling) is essentially complete. Phase 1 (the NEC V60
-CPU core) is underway: `src/cpu/v60/` implements a register file, flags,
-and a growing, unit-tested instruction/addressing-mode slice — HALT, NOP,
-MOV, CMP, ADD, SUB, all 15 conditional branches, and JMP/JSR/RSR/RET, over
-register-direct/indirect/autoincrement/autodecrement/displacement-8
-addressing (see `docs/hardware-notes/07-v60-architecture.md`). Run the unit
-tests with:
+The NEC V60 main CPU core (`src/cpu/v60/`) covers a substantial
+instruction/addressing-mode subset and is validated against a real MAME
+`v60_device` reference (no game ROM needed — see `tools/oracle-harness/`,
+37/37 hand-written test programs matching exactly). The Model 1 I/O
+board's Z80 core (`src/cpu/z80/`) is similarly underway and oracle-
+validated. The Geometrizer/rasterizer video pipeline (transform, project,
+clip, light, sort, rasterize) is implemented as pure, ROM-independent
+math. The bus/memory map, ROM loading, sound board, TGP coprocessor, and
+2D tile layer are all still early or not started. See
+[docs/planning/05-roadmap.md](docs/planning/05-roadmap.md) for the
+authoritative, up-to-date phase-by-phase status — it's updated after every
+increment, unlike this summary.
+
+Run the unit tests with:
 
 ```
 cmake -S . -B build && cmake --build build && ./build/model1_unit_tests
 ```
 
-Beyond our own unit tests, `tools/oracle-harness/` validates this core
-against a real MAME `v60_device` (no game ROM needed) — currently 8/8
-hand-written test programs match the reference exactly. See that
-directory's README to set it up.
+## Boot-tracing a real ROM
+
+`model1emu` (built by the same `cmake --build build` above) is not yet a
+playable emulator — there's no video/sound/input wired up, and most of the
+bus is still stubbed. What it does today: load a real ROM set, reset the
+V60 core against it, and trace execution until it hits something this
+project doesn't implement yet. This turns "what does the core need next"
+into a concrete, reproducible PC/opcode/address instead of a guess:
+
+```
+./build/model1emu /path/to/your/vf/roms vf
+./build/model1emu /path/to/your/vr/roms vr
+```
+
+The ROM directory must contain your own legally-dumped files named exactly
+as MAME's driver expects (see `src/board/games/virtua_fighter.cpp` /
+`virtua_racing.cpp` for the exact filenames/sizes/CRC32s, sourced from
+MAME's ROM_START blocks as fingerprints only — see the legal doc below).
+A third, optional argument caps the instruction budget (default 2,000,000).
+The trace stops and reports exactly where on: an unimplemented V60 opcode
+or addressing mode, an unmapped bus address, or a long run of PC advancing
+by exactly +1 (a sign of drifting through uninitialized memory, including
+the V60's own `HALT`, which — per `docs/hardware-notes/07-v60-architecture.md`
+— doesn't actually halt anything).
 
 Start here for the full picture:
 

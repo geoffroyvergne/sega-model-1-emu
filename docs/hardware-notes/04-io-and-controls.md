@@ -44,11 +44,70 @@ core I/O board we actually need to emulate for single-cabinet play.
   through CN1 — no analog inputs needed, simplest of the three I/O-wise.
 - **Star Wars Arcade:** analog flight-stick + trigger via CN1/M6253.
 
+## The I/O board is a full second computer, not a register bank [confirmed against model1io.cpp/.h and model1.cpp]
+
+Reading `model1io.cpp`/`model1io.h` and the relevant parts of `model1.cpp`
+directly (Phase 7 research) confirms the earlier "still to verify" note
+above: the standard I/O board isn't a handful of memory-mapped registers
+the main V60 reads — it's its own complete Z80-based computer:
+
+- The board's Z80 runs real firmware (`EPR-14869` for Virtua Racing;
+  `EPR-14869B` for Virtua Fighter/Star Wars Arcade — same fingerprint-only
+  policy as every other ROM, see `docs/planning/06-legal-and-assets.md`)
+  that talks to the Sega custom `315-5338A` chip (a fixed-function
+  parallel-port-style I/O multiplexer, modeled behaviorally in MAME, not
+  microcode-emulated) and the OKI `M6253` ADC (which is what actually
+  digitizes the wheel/pedals/stick).
+- `315-5338A`'s 8 GPIO "ports" (PA-PG in the source) are individually
+  wired to specific jobs, confirmed from `model1io_device`'s callback
+  wiring: PA is write-only and drives the 93C45 EEPROM's clock/CS/DI
+  lines plus a "which control set is active" flip-flop
+  (`m_secondary_controls`); PB/PC/PD read either that active control
+  set's analog-adjacent digital inputs or one of 3 DIP-switch banks,
+  selected by that same flip-flop; PE is a bidirectional link to a
+  "drive board" (Virtua Racing's force-feedback motor controller — out of
+  scope, see the overview doc's non-goals); PF is a generic output latch
+  (coin counters, lamps); PG reads the EEPROM's data-out line plus 4
+  cabinet test/service buttons. The 4 analog channels are also
+  double-buffered the same way (2 "primary" + 2 "secondary" per ADC
+  channel, switched by the same flip-flop) — confirmed by
+  `analog0_r`..`analog3_r` each picking between `m_an_cb[N]` and
+  `m_an_cb[N+4]`.
+- **The board talks to the main V60 board through a dual-port RAM chip**
+  (`mb8421`, 2KB), not a serial link or a bank of discrete registers:
+  `model1.cpp` wires the I/O board's `read_callback`/`write_callback` to
+  the DPRAM's "left" port, and maps the main CPU's `0xc00000-0xc00fff`
+  (byte-wide, `.umask16(0x00ff)` — matches every other byte-wide
+  peripheral already confirmed on this bus) to that same DPRAM's "right"
+  port (`model1_state::dpram_r` / `mb8421_device::right_w`). The read
+  side additionally inserts a 1-cycle wait-state on the V60
+  (`adjust_icount(-1)`) — a real hardware detail, but pure timing with no
+  effect on the emulator until cycle-accurate scheduling exists.
+- **The DPRAM's byte-offset layout (which offset means "wheel angle" vs.
+  "brake" vs. "button state") is not defined anywhere in MAME's own
+  driver source.** It's a private convention between the I/O board's real
+  Z80 firmware and the real game ROM — both proprietary binaries neither
+  MAME nor this project has any static knowledge of. MAME gets this right
+  purely by *running both ROMs faithfully* and letting them agree with
+  each other over shared memory; it never hardcodes or documents the
+  convention itself. This rules out reverse-engineering a plausible-
+  looking offset table by inspection — there is nothing to inspect, and
+  guessing one would be exactly the kind of unverifiable behavior this
+  project's research discipline exists to avoid.
+
+**Decision**: build a real Z80 CPU core (`src/cpu/z80/`) and, in a later
+increment, the `315-5338A`/`M6253`/DPRAM glue around it, so a user's own
+legally-dumped `EPR-14869[B]` can run the real protocol — the same
+approach already taken for the main V60/TGP ROMs, just for a second,
+much simpler CPU. This is more work than "wire up a register bank," but
+it's the only way to get real analog input working without inventing
+unverifiable behavior. See `docs/planning/05-roadmap.md` Phase 7.
+
 ## Open questions for the next research pass
 
 - Exact `ioport()` port/bit definitions per game in `model1.cpp` (needed to
-  build accurate input mapping tables for Phase 7/8/9).
-- Exact protocol on the I/O board's Z80 ↔ main V60 link (which memory-mapped
-  dual-port RAM region, timing/handshake) — the main map's
-  `0xc00000-0xc00fff` "I/O — dual-port RAM" region (see `01-cpu-and-bus.md`)
-  is the likely channel; confirm by reading the relevant handlers.
+  build accurate input mapping tables once the I/O board's glue logic is
+  wired up).
+- The `315-5338A`'s own read/write protocol at the Z80's `0x8000-0x800f`
+  (confirmed above) and the `msm6253`'s `0xc000-0xc003` — needed before
+  the glue-logic increment; not yet read in detail.

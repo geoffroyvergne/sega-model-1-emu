@@ -218,6 +218,22 @@ the legal doc). What's built so far is fully exercised by 19 new unit
 tests against synthetic data instead, and is ready to load a real dump the
 moment one is available.
 
+That moment came sooner than the rest of this phase: the user has their
+own legally-dumped Virtua Fighter set. Added `src/board/games/
+virtua_fighter.{h,cpp}` (Virtua Fighter's real main-CPU ROM fingerprints,
+confirmed against MAME's `ROM_START(vf)` — structurally identical layout
+to Virtua Racing's, just different files/CRCs) and turned `src/main.cpp`
+from an empty placeholder into a real boot-trace driver: load a ROM set,
+reset the V60 against it, and trace execution until it hits an
+unimplemented opcode/addressing mode, an unmapped bus address, or a
+PC-drifting-by-+1 stall (see the root README's "Boot-tracing a real ROM"
+section for usage). This is deliberately not a step toward a playable
+emulator yet — no video/sound/input, most of the bus still stubbed — its
+purpose is to convert "what does the core need next" from a guess into an
+empirical answer, which is also expected to be the fastest way to
+discover the *real*, ROM-specific scope of Phase 5 (the TGP coprocessor)
+rather than guessing at it from documentation alone.
+
 Building the TGP RAM interface surfaced a real bug, caught by a unit test
 rather than by inspection: that register is genuinely 16-bit-wide in
 hardware, and this bus's usual approach (build 16-bit access generically
@@ -297,6 +313,84 @@ See `docs/hardware-notes/05-video.md`.*
 **Exit criterion:** framebuffer pixel-diff against oracle screenshots matches
 (within tolerance) for representative in-game frames, not just menus.
 
+**Status:** started, out of order relative to Phase 3 — picked up early
+because it's pure math with no ROM or tile-layer dependency, unlike every
+other open phase, all of which are ultimately blocked on real ROMs for
+their actual exit criteria. `src/video/geometrizer.{h,cpp}` implements the
+transform and projection stages (object-space → view-space →
+screen-space), confirmed against `model1_v.cpp`'s
+`view_t::transform_point`/`project_point`/`project_point_direct`, with 6
+unit tests including a 90-degree rotation whose expected result was
+derived independently by hand rather than re-deriving the same formula.
+It now also implements the 4 frustum-clipping plane test/intersection
+primitives (`is_clipped_bottom/top/left/right`, `clip_bottom/top/left/right`,
+`recompute_frustum`), confirmed against `view_t::recompute_frustum` and
+`fclip_isc_*`/`fclip_clip_*`, with 4 more unit tests using a hand-derived
+"unit-slope" frustum, **and** the recursive quad-clipping orchestration
+that drives them across a full quad (`View::clip_quad`), confirmed
+line-by-line against `fclip_push_quad`/`fclip_push_quad_next`'s full case
+analysis and returning clipped quads/triangles by value instead of the
+reference's preallocated-arena approach. 3 more hand-derived unit tests
+cover fully-inside/fully-outside/single-vertex-clipped cases. It now also
+implements the lighting and view-space backface-cull primitives
+(`transform_vector`, `set_light_direction`, `set_light_param`,
+`set_specular_enabled`, `compute_specular`, `compute_lighting`, and the
+free function `view_determinant`), confirmed against
+`view_t::transform_vector`/`set_light_direction`/`set_lightparam`,
+`model1_state::compute_specular`, and `model1_state::view_determinant` —
+including `compute_specular`'s non-continuous power-of-two selection
+(squaring at thresholds 2/4/7, not a generic `pow()`), transcribed
+exactly. 7 more unit tests cover these, including one that specifically
+proves light-direction normalization takes effect. It now also implements
+the back-to-front quad sort (`sort_quads`, plus a `z` sort key added to
+`Quad`, propagated through `clip_quad`'s sub-quads), confirmed against
+`quad_t::compare`/`sort_quads` — including the finding that the
+reference's qsort-plus-pointer-tiebreak is exactly reproduced by a plain
+`std::stable_sort` on descending `z`, with no manual tiebreak needed. 3
+more unit tests cover it. Rasterization is now partially implemented: a
+new `Framebuffer` type (`src/video/framebuffer.{h,cpp}`) plus the
+per-scanline pixel-writing primitives `draw_hline`/`draw_hline_moired`/
+`fill_line`/`fill_slope`, confirmed against the reference functions of
+the same name — including two confirmed-and-replicated reference quirks
+(a tautological `||` overlap pre-check with no functional effect, and
+`fill_slope`'s early-return leaving its outputs untouched) and one
+subtle-but-load-bearing detail (`fill_slope`'s internal left/right edge
+swap also swaps which output pointer each edge's progression is written
+to, so callers always see output-to-input correspondence by original
+argument position, verified with a test that deliberately triggers the
+swap). 10 more unit tests cover these (152 unit tests total project-wide,
+827 assertions, zero warnings under `-Wall -Wextra -Wpedantic`).
+
+It now also implements `fill_quad`'s dual-edge scanline-walking
+orchestration and its embedded wireframe-line special case
+(`draw_wireframe_line`, with Liang-Barsky endpoint clipping plus integer
+Bresenham), confirmed against the reference functions of the same name —
+including the finding that the reference's screen coordinates truncate to
+integer pixels at projection time (its `point_t::s.x`/`s.y` are `int32_t`
+fields), replicated by truncating at `fill_quad`'s own boundary instead
+of inside the already-tested `project_point`/`project_point_direct`
+(functionally identical, since nothing observes the fractional part in
+between). `Quad` gained a `col` field (propagated through `clip_quad`
+alongside `z`, matching `fclip_push_quad_next` exactly). 9 more unit
+tests cover this (161 unit tests total project-wide, 1185 assertions,
+zero warnings under `-Wall -Wextra -Wpedantic`).
+
+**Every Phase 6 pipeline stage is now implemented as pure, ROM-independent,
+unit-tested math**: transform, project, clip, light, sort, rasterize. All
+that remains is the `push_object` vertex-stream traversal that reads real
+per-game polygon/texture/light-mode/color data from ROM and drives
+everything above with it — blocked on real ROM data regardless of
+implementation order, unlike everything implemented so far in this phase.
+
+Real finding: `transform_point`'s reference formula includes a view-offset
+and extra yaw-rotation term that earlier research (Phase 0) assumed was
+real per-game camera data. Tracing every assignment to those fields shows
+they're set **only** by a developer debug-camera control wrapped in
+`#if 0` — compiled out entirely, never touched by real game data. The
+operative transform is just the plain 3×4 affine matrix; see the hardware
+note for the full story and the exact dead-code formula, kept on record in
+case a target game is ever found to need it after all.
+
 ## Phase 7 — Input/IO for Virtua Racing (est. 2–3 weeks)
 
 - Analog wheel + pedal I/O board emulation, frontend input mapping/
@@ -308,6 +402,186 @@ correctly mapped analog controls.
 **→ This is the "Definition of done" checkpoint for game 1 (see strategy
 doc). Do not start Phase 8 until this is genuinely solid — the second and
 third games will stress-test every assumption made so far.**
+
+**Status:** started, out of order relative to Phases 3-5 (same rationale
+as Phase 6: pulling forward the piece that's pure, ROM-independent,
+testable logic). Research (`docs/hardware-notes/04-io-and-controls.md`)
+found the standard I/O board is a full second computer (its own Z80,
+running real firmware, talking to a `315-5338A` I/O chip and an M6253
+ADC, linked to the main V60 board via a dual-port RAM chip at
+`0xc00000-0xc00fff`) whose shared-memory protocol is a private convention
+between two proprietary ROMs that MAME's own source never documents —
+ruling out guessing a DPRAM offset layout, since there's nothing to
+verify it against. Building a real Z80 core to run the real firmware
+(same approach as the main V60/TGP ROMs) is therefore the only way to get
+this right, so that's what's underway.
+
+`src/cpu/z80/{h,cpp}` implements the register file and a growing slice of
+the unprefixed opcode map: the full `LD r,r'`/`LD r,(HL)`/`LD (HL),r`
+group (with `0x76` correctly special-cased as HALT rather than
+"LD (HL),(HL)"), 8-bit and 16-bit immediate loads, 8-bit and 16-bit
+INC/DEC, the complete ALU-vs-A group (ADD/ADC/SUB/SBC/AND/XOR/OR/CP, both
+register and immediate forms), unconditional and conditional
+JP/JR/CALL/RET, DJNZ, PUSH/POP (including the real, easy-to-miss quirk
+that PUSH/POP's 2-bit register-pair encoding means AF where the
+otherwise-identical encoding used by `LD dd,nn`/16-bit INC/DEC means SP),
+the exchange instructions (EX DE,HL / EX (SP),HL / EX AF,AF' / EXX), CPL,
+DAA, and SCF/CCF. 36 unit tests cover this, including hand-derived
+flag-computation cases (signed overflow, half-carry, borrow, parity, two
+worked BCD examples for DAA) and one confirming INC/DEC's real quirk of
+never touching the carry flag. 197 unit tests total project-wide, zero
+warnings under `-Wall -Wextra -Wpedantic`.
+
+Deliberately not yet implemented, each its own future increment: the
+CB-prefixed (rotate/shift/BIT/SET/RES), ED-prefixed (block instructions,
+16-bit ADC/SBC HL, NEG, interrupt modes, RETN/RETI, LD A,I/LD A,R,
+RRD/RLD), and DD/FD-prefixed (IX/IY indexed addressing) opcode groups;
+RST; interrupt acceptance; and I/O port IN/OUT (needed for the
+`315-5338A`/ADC glue logic that comes after the core itself is solid).
+Given how well-documented and stable Z80 semantics are (unlike the
+undocumented V60), this project treats MAME's z80.cpp/z80.inc as
+available for spot-checks rather than as the sole source of truth — see
+the header comment in `z80.h` for the full reasoning.
+
+Extended the oracle-harness methodology (`tools/oracle-harness/`) to the
+Z80 core: `z80test.cpp`/`compare_z80.py` mirror the V60 harness's design
+(a minimal MAME driver plus a Python script that builds small machine-code
+programs and checks the real `z80_device`'s resulting state), simplified
+in two ways the Z80 allows: no configurable/masked reset vector to account
+for (always resets to `PC=0x0000`), and `HALT` genuinely halts in both
+this core and the reference, so it's a stable test-program landing point
+with no self-branch trick needed (unlike the V60's `HALT`-that-keeps-going
+quirk). Flag checks use two pseudo-keys, `F_set`/`F_clear`, rather than
+exact-matching the whole `F` register, so a test doesn't have to predict
+the undocumented Y/X bits by hand just to pass — see the harness README's
+Z80 section.
+
+**Actually run against a real MAME checkout this increment** (one was
+available in this environment) — both harnesses pass in full: **37/37**
+for the V60 core (`compare_v60.py`, confirming no regressions) and
+**35/35** for the Z80 core (`compare_z80.py`, covering everything above).
+This included using the oracle to empirically settle something the
+project would otherwise have had to leave as an untested guess: SCF/CCF's
+undocumented Y/X flags. This core always mirrors them from the current
+accumulator rather than modeling real hardware's internal "Q register"
+(which also depends on whether the *preceding* instruction affected
+flags) — confirmed correct against real MAME in both the obvious case and
+a deliberately adversarial one (current A with both bits clear,
+immediately after a CP whose own internal result has both bits set; real
+hardware agrees with "mirror A," not "carry over the last flags-affecting
+op's result"). See `z80.h`'s comment on this for the full reasoning and
+its limits.
+
+Implemented the full CB-prefixed opcode group next: RLC/RRC/RL/RR/SLA/
+SRA/SLL(undocumented)/SRL and BIT/RES/SET, all 256 opcodes, decoded
+uniformly via the standard 2-bit-group/3-bit-operation-or-bit/3-bit-
+register encoding. 15 more unit tests cover it (213 unit tests total
+project-wide, zero warnings). Running the *new* oracle tests against real
+MAME caught a real bug before it ever shipped: `BIT b,(HL)`'s undocumented
+Y/X flags don't mirror the tested byte (as they correctly do for every
+register operand) — they come from the high byte of an internal address
+latch set to HL+1 during the memory read, a genuine hardware quirk this
+core initially got wrong by naively reusing the register-operand
+approximation. Caught with a deliberately discriminating test (tested
+byte with both undocumented bits set, HL+1's high byte with both clear)
+before trusting the approximation, fixed, and kept as a permanent
+regression test — this project's third real bug caught by the oracle
+methodology, after the two V60 bugs. **47/47** for `compare_z80.py` after
+the fix; V60's `compare_v60.py` re-run clean at 37/37 too (no
+regressions).
+
+Audited the unprefixed opcode map for gaps before moving on to the
+ED-prefixed group, and found a real one: several foundational unprefixed
+instructions had been skipped in the original pass while focus was on
+loads/ALU/jumps. Filled them all in: `LD (BC),A`/`LD A,(BC)`/`LD (DE),A`/
+`LD A,(DE)`, `LD (nn),HL`/`LD HL,(nn)`/`LD (nn),A`/`LD A,(nn)`, `ADD
+HL,ss` (confirmed leaving S/Z/PV completely untouched, unlike every other
+add/subtract this core implements — a real, well-known quirk that also
+sets up the precedent for ED's ADC/SBC HL,ss, which *do* set them), the
+accumulator-only fast rotates RLCA/RRCA/RLA/RRA (implemented by reusing
+the CB-prefixed rlc/rrc/rl/rr helpers for their C/H/N/Y/X computation and
+then restoring S/Z/PV to their pre-instruction values, since the
+accumulator-only forms don't touch those flags the way CB's register
+forms do), `RST`, `JP (HL)` (jumps to HL's *value*, never dereferencing
+it — a classic naming trap), `LD SP,HL`, and `DI`/`EI` (opcodes exist now;
+nothing gates on them yet, since interrupt acceptance isn't implemented).
+18 more unit tests plus 10 more oracle tests cover this (222 unit tests
+total project-wide, zero warnings; **56/56** on `compare_z80.py`). The
+unprefixed opcode map is now complete except I/O ports (IN/OUT) and the
+DD/FD (IX/IY indexed addressing) prefixes.
+
+Next up: the ED-prefixed group (16-bit ADC/SBC HL, extended 16-bit
+memory loads, NEG, block instructions, IM 0/1/2, RETN/RETI, LD A,I/LD
+A,R, RRD/RLD) — the last major unprefixed-adjacent piece before I/O ports
+and the DD/FD indexed-addressing prefixes.
+
+Implemented that ED-prefixed group next, minus the I/O-port-dependent
+block instructions (INI/IND/INIR/INDR/OUTI/OUTD/OTIR/OTDR) and plain
+IN/OUT, which need actual port support this core doesn't have yet: 16-bit
+`ADC`/`SBC HL,ss` (confirmed these DO set S/Z/PV, unlike plain `ADD
+HL,ss`), the extended 16-bit memory loads (`LD (nn),dd`/`LD dd,(nn)`),
+`NEG` (reusing `sub_core` exactly the way the reference's own `neg()`
+does), `LD A,I`/`LD A,R`/`LD I,A`/`LD R,A`, `RRD`/`RLD` (4-bit nibble
+rotation across A and `(HL)`), `IM 0/1/2` and `RETN`/`RETI` (canonical
+opcodes only — the documented duplicate encodings for these aren't
+covered), and the block transfer/compare group (`LDI`/`LDD`/`LDIR`/`LDDR`,
+`CPI`/`CPD`/`CPIR`/`CPDR`, including their well-established — not
+disputed the way SCF/CCF's Q-register is — undocumented Y/X flag rule
+derived from `transferred_byte + A` or the comparison result). 22 more
+unit tests cover this (240 unit tests total project-wide, zero warnings).
+
+Extended `compare_z80.py` with matching oracle tests and found, while
+debugging two mismatches, that they were bugs in the **test script**, not
+the core: an `LD BC,2` encoded with its immediate bytes backwards
+(`0x01,0x00,0x02` loads `BC=0x0200`, not `2` — needs `0x01,0x02,0x00`),
+caught in two separate tests. A third mismatch was real but not a core
+bug either: a test for "`LD R,A` then `LD A,R` round-trips plainly"
+came back 3 higher than expected, which is real hardware's R-register
+auto-increment (on every M1/opcode-fetch cycle, including the
+intervening instructions between the store and the read-back) doing
+exactly what it does on real silicon — a quirk this core has always
+listed as not-yet-implemented, not a new finding. Removed that
+specific oracle test (there's no way to write a meaningful one for R
+specifically without implementing the auto-increment) and kept the
+two byte-order fixes as corrected permanent tests. **68/68** on
+`compare_z80.py` after both fixes; V60's `compare_v60.py` re-run clean
+at 37/37 too.
+
+Remaining before the unprefixed-and-ED-adjacent work is fully done:
+I/O ports (unprefixed `IN`/`OUT` plus the ED-prefixed I/O-block
+instructions and `IN r,(C)`/`OUT (C),r`), needed specifically for the
+`315-5338A`/ADC glue logic this whole Z80 detour exists to eventually
+support — and the DD/FD-prefixed (IX/IY indexed addressing) group.
+
+Implemented the non-block-instruction half of that I/O port work: the
+unprefixed `IN A,(n)`/`OUT (n),A` and the ED-prefixed `IN r,(C)`/
+`OUT (C),r` (all 8 register-or-undocumented-form encodings, including the
+undocumented "IN (C)" at 0x70 that sets flags but discards the value, and
+"OUT (C),0" at 0x71 that writes a literal zero). Extended `Bus` with
+`port_read`/`port_write`, taking the *full* 16-bit port address real
+hardware puts on the bus — confirmed via two deliberately discriminating
+oracle tests (write the same low port byte with two different upper-byte
+sources, then read back through the first; a naive 8-bit-only port
+implementation would have the two writes collide and fail the read-back,
+where the correct 16-bit-aware one doesn't). 6 more unit tests plus 2
+oracle tests cover this (246 unit tests total project-wide, zero
+warnings; **70/70** on `compare_z80.py`, **37/37** on `compare_v60.py`,
+no regressions). Extended `z80test.cpp` with a real `AS_IO` address map
+(RAM-backed, since test programs verify port behavior by reading back
+through a register rather than inspecting the I/O space directly) so the
+oracle could actually exercise these for real.
+
+Deliberately deferred: the I/O-block instructions
+(INI/IND/INIR/INDR/OUTI/OUTD/OTIR/OTDR), which have historically-disputed
+undocumented "K-flag" formulas — a real, well-scoped future increment,
+not something to guess at even with an oracle to check against, since
+getting the *setup* subtly wrong could still pass a hastily-written test.
+Also still deferred: the DD/FD-prefixed (IX/IY indexed addressing) group,
+and interrupt acceptance (IRQ/NMI). With plain IN/OUT now working, the
+Z80 core can read/write registers on a real I/O chip — the next step
+toward Phase 7's actual goal is the `315-5338A`/`M6253` glue logic
+(`docs/hardware-notes/04-io-and-controls.md`), not further Z80 opcode
+coverage, unless real firmware disassembly reveals a specific gap first.
 
 ## Phase 8 — Virtua Fighter bring-up (est. 6–10 weeks, real risk of running longer)
 

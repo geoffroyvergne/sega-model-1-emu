@@ -57,6 +57,7 @@ def run(name, program: bytes, regs: dict, expect: dict) -> bool:
     subprocess.run(
         [os.path.join(MAME_DIR, "mame"), "v60test",
          "-video", "none", "-sound", "none", "-skip_gameinfo",
+         "-window", "-nomaximize",
          "-nothrottle", "-seconds_to_run", "1"],
         cwd=MAME_DIR, env={**os.environ, "V60TEST_IN": IN_PATH, "V60TEST_OUT": OUT_PATH},
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30,
